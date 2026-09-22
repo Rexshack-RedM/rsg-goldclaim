@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rsg-goldclaim</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app" class="hidden">
+
+        <!-- ============ context menu panel ============ -->
+        <div id="context-panel" class="panel context-panel hidden">
+            <div class="panel-header">
+                <button id="context-back" class="icon-btn hidden" title="Back">
+                    <i class="fa-solid fa-chevron-left"></i>
+                </button>
+                <div class="panel-titles">
+                    <h1 id="context-title" class="panel-title"></h1>
+                    <p id="context-subtitle" class="panel-subtitle"></p>
+                </div>
+                <button id="context-close" class="icon-btn" title="Close">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+            <div class="divider"><span>&#9670;</span></div>
+            <div id="context-options" class="option-list"></div>
+        </div>
+
+        <!-- ============ modal (input dialog / confirm / alert) ============ -->
+        <div id="modal-overlay" class="modal-overlay hidden">
+            <div class="modal">
+                <h2 id="modal-title" class="modal-title"></h2>
+                <div class="ink-divider"></div>
+                <div id="modal-fields" class="modal-fields"></div>
+                <div id="modal-actions" class="modal-actions"></div>
+            </div>
+        </div>
+
+        <!-- ============ crafting: missing items alert ============ -->
+        <div id="missing-items-overlay" class="modal-overlay hidden">
+            <div class="modal">
+                <h2 class="modal-title" id="missing-items-title">Missing Materials</h2>
+                <div class="ink-divider"></div>
+                <div id="missing-items-list" class="modal-fields"></div>
+                <div class="modal-actions center">
+                    <button id="missing-items-close" class="wood-btn">Close</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============ crafting: progress overlay ============ -->
+        <div id="progress-overlay" class="modal-overlay hidden">
+            <div class="modal">
+                <h2 class="modal-title" id="progress-title"></h2>
+                <div class="ink-divider"></div>
+                <div class="stat-bar-track">
+                    <div id="progress-fill" class="stat-bar-fill stat-good" style="width: 0%;"></div>
+                </div>
+                <div class="modal-actions center">
+                    <button id="progress-cancel" class="wood-btn wood-btn-muted">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============ smelter crafting panel ============ -->
+        <div id="crafting-panel" class="panel crafting-panel hidden">
+            <div class="panel-header">
+                <div class="panel-titles panel-titles-center">
+                    <h1 id="storeName" class="panel-title">Smelter</h1>
+                    <p id="itemsTitle" class="panel-subtitle">Smeltable Items</p>
+                </div>
+                <button id="closeButton" class="icon-btn" title="Close">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+            <div class="divider"><span>&#9670;</span></div>
+            <div id="categoryList" class="category-tabs"></div>
+            <div class="crafting-layout">
+                <div class="crafting-col items-col">
+                    <div id="itemGrid" class="item-grid"></div>
+                </div>
+                <div class="crafting-col details-col">
+                    <h3 id="detailsTitle" class="sub-heading">Item Details</h3>
+                    <div id="itemDetails" class="details-content">
+                        <p class="empty-state" id="detailsEmptyState">Select an item to view details</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
