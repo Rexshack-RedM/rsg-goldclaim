@@ -1,4 +1,3 @@
--- rsg-goldclaim: gold rocker / claim subsystem
 CREATE TABLE `player_goldrockers` (
     `id` int(11) NOT NULL AUTO_INCREMENT,
     `citizenid` varchar(50) DEFAULT NULL,
@@ -12,9 +11,8 @@ CREATE TABLE `player_goldrockers` (
     `water` int(3) NOT NULL DEFAULT 0,
     `quality` int(3) NOT NULL DEFAULT 100,
     PRIMARY KEY (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- rsg-goldclaim: smelter subsystem
 CREATE TABLE IF NOT EXISTS `player_smelter` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `citizenid` varchar(50) DEFAULT NULL,
@@ -22,4 +20,4 @@ CREATE TABLE IF NOT EXISTS `player_smelter` (
   `propid` int(11) NOT NULL,
   `proptype` varchar(50) DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
