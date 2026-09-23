@@ -278,34 +278,36 @@ RegisterNetEvent('rsg-goldclaim:smelter:crafting', function(name, recipeKey, cra
     local recipe = Config.Smelter.Recipes[recipeKey]
     if not recipe then return end
 
+    -- close the crafting menu so only the progress bar shows while crafting
+    SendNUIMessage({ action = 'closeCrafting' })
+    SetNuiFocus(false, false)
+
     local ped = PlayerPedId()
     TaskStartScenarioInPlace(ped, GetHashKey('WORLD_HUMAN_CROUCH_INSPECT'), crafttime, true, false, false, false)
 
-    SendNUIMessage({
-        action = 'startProgress',
-        actionType = locale('smelter_label_crafting'),
-        duration = crafttime
-    })
-
-    RSGCore.Functions.Progressbar('smelt', locale('smelter_progressbar_smelting') .. name, crafttime, false, true, {
-        disableMovement = true,
-        disableCarMovement = true,
-        disableMouse = false,
-        disableCombat = true,
-    }, {}, {}, {}, function() -- Done
+    if lib.progressBar({
+        duration = crafttime,
+        label = locale('smelter_progressbar_smelting') .. name,
+        position = 'bottom',
+        useWhileDead = false,
+        canCancel = true,
+        disable = { move = true, car = true, combat = true },
+    }) then
+        -- Done
         -- the server looks up the authoritative recipe from recipeKey itself
         TriggerServerEvent('rsg-goldclaim:smelter:server:finishcrafting', recipeKey, quantity)
         ClearPedTasks(ped)
-    end, function() -- Cancel
+    else
+        -- Cancelled
         ClearPedTasks(ped)
-    end)
+    end
 end)
 
 ---------------------------------------------
 -- cancel crafting from NUI
 ---------------------------------------------
 RegisterNUICallback('cancelCrafting', function(data, cb)
-    TriggerEvent('RSGCore:Client:CancelProgressbar')
+    lib.cancelProgress()
     cb({})
 end)
 

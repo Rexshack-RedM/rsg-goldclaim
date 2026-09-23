@@ -610,6 +610,10 @@ window.addEventListener('message', (event) => {
         case 'openCrafting':
             openCraftingPanel(data);
             break;
+        case 'closeCrafting':
+            craftingPanel.classList.add('hidden');
+            hideAppIfAllClosed();
+            break;
         case 'showMissingItems':
             showMissingItems(data.missingItems);
             break;

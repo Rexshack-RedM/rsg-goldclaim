@@ -68,6 +68,30 @@ local function LoadModel(model)
 end
 
 ---------------------------------------------
+-- helper: remove an auto-attached scenario prop (e.g. the bucket that
+-- WORLD_HUMAN_BUCKET_POUR_LOW spawns on its own). ClearPedTasks does not
+-- reliably despawn scenario-owned props, so we hunt it down and delete it.
+---------------------------------------------
+local ScenarioBucketModels = { `p_bucket03x`, `p_bucket01x`, `p_cs_bucket01x`, `p_cs_bucket01bx` }
+
+local function RemoveScenarioBucketProp(ped)
+    Wait(100) -- let the scenario/task teardown finish before touching the prop
+    local pos = GetEntityCoords(ped)
+    for i = 1, #ScenarioBucketModels do
+        local obj = GetClosestObjectOfType(pos.x, pos.y, pos.z, 1.5, ScenarioBucketModels[i], false, false, false)
+        if obj and obj ~= 0 and DoesEntityExist(obj) then
+            if IsEntityAttachedToEntity(obj, ped) then
+                DetachEntity(obj, true, false)
+            end
+            SetEntityAsMissionEntity(obj, false, false)
+            DeleteObject(obj)
+        end
+    end
+    -- force a full task/control reset in case the scenario left movement disabled
+    ClearPedTasksImmediately(ped)
+end
+
+---------------------------------------------
 -- helper: get prop data by id
 ---------------------------------------------
 local function GetPropDataById(propid)
@@ -428,7 +452,7 @@ RegisterNetEvent('rsg-goldclaim:rocker:client:addpaydirt', function(rockerid)
 
     local ped = PlayerPedId()
     FreezeEntityPosition(ped, true)
-    local anim = Config.Anims.crouch_inspect
+    local anim = Config.Anims.add_paydirt
     TaskStartScenarioInPlace(ped, anim, 0, true)
 
     if lib.progressBar({
@@ -441,11 +465,13 @@ RegisterNetEvent('rsg-goldclaim:rocker:client:addpaydirt', function(rockerid)
     }) then
         ClearPedTasks(ped)
         FreezeEntityPosition(ped, false)
+        RemoveScenarioBucketProp(ped)
         TriggerServerEvent('rsg-goldclaim:rocker:server:addpaydirt', rockerid)
         Notify(locale('rocker_paydirt_added'), nil, 'tick', 3000, 'SUCCESS')
     else
         ClearPedTasks(ped)
         FreezeEntityPosition(ped, false)
+        RemoveScenarioBucketProp(ped)
     end
 
     LocalPlayer.state:set("inv_busy", false, true)
@@ -472,7 +498,7 @@ RegisterNetEvent('rsg-goldclaim:rocker:client:addwater', function(rockerid)
 
     local ped = PlayerPedId()
     FreezeEntityPosition(ped, true)
-    local anim = Config.Anims.crouch_inspect
+    local anim = Config.Anims.add_water
     TaskStartScenarioInPlace(ped, anim, 0, true)
 
     if lib.progressBar({
@@ -485,11 +511,13 @@ RegisterNetEvent('rsg-goldclaim:rocker:client:addwater', function(rockerid)
     }) then
         ClearPedTasks(ped)
         FreezeEntityPosition(ped, false)
+        RemoveScenarioBucketProp(ped)
         TriggerServerEvent('rsg-goldclaim:rocker:server:addwater', rockerid)
         Notify(locale('rocker_water_added'), nil, 'tick', 3000, 'SUCCESS')
     else
         ClearPedTasks(ped)
         FreezeEntityPosition(ped, false)
+        RemoveScenarioBucketProp(ped)
     end
 
     LocalPlayer.state:set("inv_busy", false, true)
@@ -515,6 +543,7 @@ RegisterNetEvent('rsg-goldclaim:rocker:client:startprocessing', function(data)
 
         -- tell server to start processing (server handles the loop)
         local cycles = math.min(result.water, result.paydirt)
+        HideContext()
         TriggerServerEvent('rsg-goldclaim:rocker:server:processrocker', data.rockerid)
         Notify(locale('rocker_processing_started'), locale('rocker_processing_will_run', cycles), 'leaderboard_gold', 5000, 'INFO')
 

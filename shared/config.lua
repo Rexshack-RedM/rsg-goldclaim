@@ -77,6 +77,8 @@ Config.Anims = {
         name = 'base',
     },
     crouch_inspect = 'WORLD_HUMAN_CROUCH_INSPECT', -- scenario
+    add_paydirt = 'WORLD_HUMAN_FEED_PIGS',         -- scenario used when adding paydirt to a rocker
+    add_water = 'WORLD_HUMAN_BUCKET_POUR_LOW',     -- scenario used when adding water to a rocker
     bucket_fill = {
         dict = 'amb_work@world_human_bucket_fill@working@male_b@base',
         name = 'base',
