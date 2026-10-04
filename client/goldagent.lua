@@ -148,7 +148,7 @@ RegisterNetEvent('rsg-goldclaim:rocker:client:sellgoldbars', function()
     local goldBarCount = 0
 
     for _, item in pairs(playerInventory) do
-        if item.name == 'goldbar' then
+        if item.name == 'resource_gold_bar' then
             goldBarCount = goldBarCount + item.amount
         end
     end
@@ -169,7 +169,7 @@ RegisterNetEvent('rsg-goldclaim:rocker:client:sellsilverbars', function()
     local silverBarCount = 0
 
     for _, item in pairs(playerInventory) do
-        if item.name == 'silverbar' then
+        if item.name == 'resource_silver_bar' then
             silverBarCount = silverBarCount + item.amount
         end
     end

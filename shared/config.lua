@@ -234,7 +234,7 @@ Config.Smelter.Recipes = {
         ingredients = {
             [1] = { item = "smallnugget", amount = 45 }
         },
-        receive = "goldbar"
+        receive = "resource_gold_bar"
     },
     ["goldbar_medium"] = {
         name = "Gold Bar (Medium Nuggets)",
@@ -243,7 +243,7 @@ Config.Smelter.Recipes = {
         ingredients = {
             [1] = { item = "mediumnugget", amount = 30 }
         },
-        receive = "goldbar"
+        receive = "resource_gold_bar"
     },
     ["goldbar_large"] = {
         name = "Gold Bar (Large Nuggets)",
@@ -252,15 +252,15 @@ Config.Smelter.Recipes = {
         ingredients = {
             [1] = { item = "largenugget", amount = 15 }
         },
-        receive = "goldbar"
+        receive = "resource_gold_bar"
     },
     ["silverbar"] = {
         name = "Silver Bar",
         crafttime = 30000,
         category = "Silver",
         ingredients = {
-            [1] = { item = "silverore", amount = 50 }
+            [1] = { item = "resource_silver_ore", amount = 50 }
         },
-        receive = "silverbar"
+        receive = "resource_silver_bar"
     },
 }

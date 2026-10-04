@@ -49,11 +49,11 @@ This resource merges the former `mack-goldclaim` and `mack-smelter` scripts into
    - `shovel` â€” For digging paydirt
    - `paydirt` â€” Raw material for the rocker
    - `smallnugget` / `mediumnugget` / `largenugget` â€” Gold nugget outputs
-   - `goldbar` â€” Smelted gold output
+   - `resource_gold_bar` â€” Smelted gold output
    - `wood` â€” Used for rocker repairs
    - `smelter` â€” Placeable smelter equipment
-   - `silverore` â€” Raw material for the smelter
-   - `silverbar` â€” Smelted silver output
+   - `resource_silver_ore` â€” Raw material for the smelter
+   - `resource_silver_bar` â€” Smelted silver output
 
 3. **Images** â€” Copy the images from `install/images/` to your `rsg-inventory/html/images/` folder.
 

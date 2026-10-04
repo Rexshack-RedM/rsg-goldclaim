@@ -629,8 +629,8 @@ RegisterNetEvent('rsg-goldclaim:rocker:server:finishsmelt', function(nuggettype,
     Player.Functions.RemoveItem(nuggettype, amountnuggets)
 
     TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[nuggettype], 'remove')
-    Player.Functions.AddItem('goldbar', bars)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['goldbar'], 'add')
+    Player.Functions.AddItem('resource_gold_bar', bars)
+    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['resource_gold_bar'], 'add')
 end)
 
 ---------------------------------------------
@@ -643,18 +643,18 @@ RegisterNetEvent('rsg-goldclaim:rocker:server:sellgoldbars', function()
 
     local goldBarCount = 0
     for _, item in pairs(Player.PlayerData.items) do
-        if item and item.name == 'goldbar' then
+        if item and item.name == 'resource_gold_bar' then
             goldBarCount = goldBarCount + item.amount
         end
     end
 
     if goldBarCount <= 0 then return end
 
-    Player.Functions.RemoveItem('goldbar', goldBarCount)
+    Player.Functions.RemoveItem('resource_gold_bar', goldBarCount)
 
     local totalvalue = goldBarCount * Config.GoldBarPrice
     Player.Functions.AddMoney('cash', totalvalue, 'rsg-goldclaim-sell-goldbar')
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['goldbar'], "remove")
+    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['resource_gold_bar'], "remove")
 end)
 
 ---------------------------------------------
@@ -667,18 +667,18 @@ RegisterNetEvent('rsg-goldclaim:rocker:server:sellsilverbars', function()
 
     local silverBarCount = 0
     for _, item in pairs(Player.PlayerData.items) do
-        if item and item.name == 'silverbar' then
+        if item and item.name == 'resource_silver_bar' then
             silverBarCount = silverBarCount + item.amount
         end
     end
 
     if silverBarCount <= 0 then return end
 
-    Player.Functions.RemoveItem('silverbar', silverBarCount)
+    Player.Functions.RemoveItem('resource_silver_bar', silverBarCount)
 
     local totalvalue = silverBarCount * Config.SilverBarPrice
     Player.Functions.AddMoney('cash', totalvalue, 'rsg-goldclaim-sell-silverbar')
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['silverbar'], "remove")
+    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['resource_silver_bar'], "remove")
 end)
 
 ---------------------------------------------
