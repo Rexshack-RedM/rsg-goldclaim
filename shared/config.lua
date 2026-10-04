@@ -204,7 +204,7 @@ Config.Smelter.PromptRotateRight = 'Rotate Right'
 Config.Smelter.EnableVegModifier = true                       -- if set true clears vegetation around smelter
 Config.Smelter.DestroyTime       = 10000                      -- how long for destroy progress bar (ms)
 Config.Smelter.MaxSmelters       = 2                          -- max smelters a character can have
-Config.Smelter.SmelterProp       = 'p_campfirecombined01x'    -- prop used for smelter
+Config.Smelter.SmelterProp       = 'p_goldsmeltburner01x'     -- prop used for smelter
 
 ---------------------------------------------
 -- gold claim restriction

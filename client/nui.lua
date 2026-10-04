@@ -59,6 +59,11 @@ RegisterNUICallback('contextSelect', function(data, cb)
     local option = def and def.options and def.options[(data.index or 0) + 1]
 
     if option and option.event and not option.disabled then
+        -- close the menu first (unless the option opens a sub-menu), otherwise the panel stays
+        -- drawn under any follow-up modal and is left on screen without NUI focus
+        if not option.arrow and not option.keepOpen then
+            HideContext()
+        end
         TriggerEvent(option.event, option.args)
     end
 

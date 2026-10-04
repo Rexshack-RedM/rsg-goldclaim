@@ -1,5 +1,4 @@
     -- Gold Claim
-	
 	bucket              = { name = 'bucket',              label = 'Bucket',            weight = 100,  type = 'item',  image = 'bucket.png',              unique = false,  useable = true,  shouldClose = true,  description = 'Bucket — useful item to have around.',           category = 'general' },
     fullbucket          = { name = 'fullbucket',          label = 'Fullbucket',        weight = 100,  type = 'item',  image = 'fullbucket.png',          unique = false,  useable = true,  shouldClose = true,  description = 'Full Bucket — useful item to have around.',      category = 'general' },
     resource_gold_bar   = { name = 'resource_gold_bar',   label = 'Gold Bar',          weight = 100,  type = 'item',  image = 'resource_gold_bar.png',   unique = false,  useable = true,  shouldClose = true,  description = 'Gold Bar — useful item to have around.',         category = 'general' },
