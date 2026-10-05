@@ -1,48 +1,60 @@
 -----------------------------------------------------------------------------------------------
--- shared NUI helper API
--- Provides a custom leather & gold themed context-menu + modal system used to replace
--- ox_lib's lib.registerContext/showContext/inputDialog throughout rsg-goldclaim, plus the
--- crafting panel wiring used by the smelter subsystem (client/smelter.lua).
+-- custom leather & gold NUI: context menus + input dialogs
 -----------------------------------------------------------------------------------------------
-
 local registeredContexts = {}
 local contextStack = {}
 local pendingModalCallback = nil
 
------------------------------------------------------------------------------------------------
--- context menus (mirrors ox_lib's lib.registerContext / lib.showContext shape)
------------------------------------------------------------------------------------------------
+local function UiLabels()
+    return {
+        select  = locale('ui_select'),
+        cancel  = locale('ui_cancel'),
+        confirm = locale('ui_confirm'),
+        close   = locale('ui_close'),
+        back    = locale('ui_back'),
+    }
+end
 
---- def = { id, title, subtitle?, position?, menu?, onBack?, options = { { title, description?, icon?, event?, args?, arrow?, disabled?, progress?, colorScheme? }, ... } }
+-----------------------------------------------------------------------------------------------
+-- context menus
+-- def = { id, title, subtitle?, menu?, onBack?, options = { { title, description?, icon?,
+--         event?, args?, arrow?, disabled?, progress?, colorScheme?, badge? } } }
+-----------------------------------------------------------------------------------------------
 function OpenContext(def)
-    if not def or not def.id then return end
-    registeredContexts[def.id] = def
+    if def and def.id then registeredContexts[def.id] = def end
 end
 
 local function renderContext(id)
     local def = registeredContexts[id]
     if not def then return end
 
+    -- strip functions/args before sending to NUI
+    local options = {}
+    for i, o in ipairs(def.options or {}) do
+        options[i] = {
+            title = o.title, description = o.description, icon = o.icon, arrow = o.arrow,
+            disabled = o.disabled, progress = o.progress, colorScheme = o.colorScheme,
+            badge = o.badge, selectable = o.event ~= nil,
+        }
+    end
+
     SendNUIMessage({
-        action = 'openContext',
-        id = id,
-        title = def.title,
-        subtitle = def.subtitle,
+        action    = 'openContext',
+        title     = def.title,
+        subtitle  = def.subtitle,
         canGoBack = #contextStack > 1,
-        options = def.options or {},
+        options   = options,
+        labels    = UiLabels(),
     })
 end
 
 function ShowContext(id)
-    local def = registeredContexts[id]
-    if not def then return end
-
-    if def.menu then
-        table.insert(contextStack, id)
+    if not registeredContexts[id] then return end
+    if registeredContexts[id].menu and #contextStack > 0 then
+        contextStack[#contextStack + 1] = id
     else
         contextStack = { id }
     end
-
     renderContext(id)
     SetNuiFocus(true, true)
 end
@@ -54,113 +66,61 @@ function HideContext()
 end
 
 RegisterNUICallback('contextSelect', function(data, cb)
+    cb({})
     local id = contextStack[#contextStack]
     local def = id and registeredContexts[id]
-    local option = def and def.options and def.options[(data.index or 0) + 1]
+    local option = def and def.options and def.options[(tonumber(data.index) or -1) + 1]
+    if not option or not option.event or option.disabled then return end
 
-    if option and option.event and not option.disabled then
-        -- close the menu first (unless the option opens a sub-menu), otherwise the panel stays
-        -- drawn under any follow-up modal and is left on screen without NUI focus
-        if not option.arrow and not option.keepOpen then
-            HideContext()
-        end
-        TriggerEvent(option.event, option.args)
-    end
-
-    cb({})
+    -- close first (unless it opens a sub-menu) so the panel isn't left under a modal
+    if not option.arrow then HideContext() end
+    TriggerEvent(option.event, option.args)
 end)
 
-RegisterNUICallback('contextBack', function(data, cb)
+RegisterNUICallback('contextBack', function(_, cb)
+    cb({})
     if #contextStack > 1 then
-        local closingId = table.remove(contextStack)
-        local closingDef = registeredContexts[closingId]
-        if closingDef and closingDef.onBack then closingDef.onBack() end
+        local closing = registeredContexts[table.remove(contextStack)]
+        if closing and closing.onBack then closing.onBack() end
         renderContext(contextStack[#contextStack])
     else
         HideContext()
     end
-
-    cb({})
 end)
 
-RegisterNUICallback('contextClose', function(data, cb)
+RegisterNUICallback('contextClose', function(_, cb)
+    cb({})
     HideContext()
-    cb({})
 end)
 
 -----------------------------------------------------------------------------------------------
--- modal / input dialog (callback based -- NUI is async, unlike ox_lib's coroutine-based
--- lib.inputDialog, so callers pass a callback instead of receiving a direct return value)
+-- input dialog (callback based)
+-- fields = { { label, description?, type = 'input'|'number'|'select', options?, required?,
+--             default?, min?, max?, maxLength? } }
+-- callback(values | nil)
 -----------------------------------------------------------------------------------------------
-
---- fields = { { label, description?, type = 'input'|'select', options?, icon?, required?, default? }, ... }
---- callback(values | nil) -- values is an array matching the fields order, nil if cancelled
 function OpenInputDialog(title, fields, callback)
+    -- cancel any dialog that is still open so its callback never leaks
+    if pendingModalCallback then pendingModalCallback(nil) end
     pendingModalCallback = callback
 
-    SendNUIMessage({
-        action = 'openModal',
-        title = title,
-        fields = fields,
-    })
+    SendNUIMessage({ action = 'openModal', title = title, fields = fields, labels = UiLabels() })
     SetNuiFocus(true, true)
 end
 
---- simple yes/no confirmation modal
---- callback(bool)
-function OpenConfirmDialog(title, description, callback)
-    OpenInputDialog(title, {
-        {
-            label = description,
-            type = 'confirm',
-        },
-    }, function(values)
-        if not values then
-            callback(false)
-            return
-        end
-        callback(values[1] == 'yes')
-    end)
-end
-
---- simple alert modal with just a message + close button (used for missing-items lists etc.)
-function OpenAlertDialog(title, lines)
-    SendNUIMessage({
-        action = 'openAlert',
-        title = title,
-        lines = lines or {},
-    })
-    SetNuiFocus(true, true)
+local function resolveModal(values)
+    SetNuiFocus(false, false)
+    local callback = pendingModalCallback
+    pendingModalCallback = nil
+    if callback then callback(values) end
 end
 
 RegisterNUICallback('modalSubmit', function(data, cb)
-    SetNuiFocus(false, false)
-    local callback = pendingModalCallback
-    pendingModalCallback = nil
-    if callback then callback(data.values) end
     cb({})
+    resolveModal(type(data.values) == 'table' and data.values or nil)
 end)
 
-RegisterNUICallback('modalCancel', function(data, cb)
-    SetNuiFocus(false, false)
-    local callback = pendingModalCallback
-    pendingModalCallback = nil
-    if callback then callback(nil) end
+RegisterNUICallback('modalCancel', function(_, cb)
     cb({})
-end)
-
-RegisterNUICallback('alertClose', function(data, cb)
-    SetNuiFocus(false, false)
-    cb({})
-end)
-
------------------------------------------------------------------------------------------------
--- misc
------------------------------------------------------------------------------------------------
-
-RegisterNUICallback('closeAll', function(data, cb)
-    contextStack = {}
-    pendingModalCallback = nil
-    SetNuiFocus(false, false)
-    cb({})
+    resolveModal(nil)
 end)

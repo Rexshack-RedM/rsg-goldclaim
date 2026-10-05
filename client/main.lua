@@ -1,777 +1,511 @@
-lib.locale()
+local SpawnedProps       = {} -- [propid] = { obj = entity }
+local SpawnedOutputProps = {} -- [outputId] = { obj = entity, rockerid = propid }
+local ClaimZones         = {} -- [propid] = { coords, name, inside, blip }
+local PropsById          = {} -- [propid] = prop data (lookup for Config.PlayerProps)
+local VegModifiers       = {} -- [propid] = veg modifier handle (added once, removed with the rocker)
 
-local RSGCore = exports['rsg-core']:GetCoreObject()
-local SpawnedProps = {}
-local SpawnedOutputProps = {}
-local ActiveZones = {}
-local ActiveBlips = {}
-local isBusy = false
-local fx_group = "scr_dm_ftb"
-local fx_name = "scr_mp_chest_spawn_smoke"
-local fx_scale = 1.0
+local FX_GROUP, FX_NAME = 'scr_dm_ftb', 'scr_mp_chest_spawn_smoke'
 
----------------------------------------------
--- helper: send ox_lib notification
----------------------------------------------
-local NotifyIcons = {
-    warning          = 'triangle-exclamation',
-    cross            = 'circle-xmark',
-    tick             = 'circle-check',
-    leaderboard_gold = 'coins',
-    awards_set_c_001 = 'box-open',
-}
-
-local NotifyTypes = {
-    ERROR    = 'error',
-    SUCCESS  = 'success',
-    INFO     = 'info',
-    TIP_GOLD = 'success',
-}
-
-local function Notify(title, description, icon, duration, template)
-    lib.notify({
-        title = title,
-        description = description,
-        type = NotifyTypes[template] or 'info',
-        icon = NotifyIcons[icon] or icon,
-        duration = duration or 5000,
-        position = 'center-right',
-    })
-end
-
----------------------------------------------
--- helper: load anim dict
----------------------------------------------
-local function LoadAnimDict(dict)
-    RequestAnimDict(dict)
-    local attempts = 0
-    while not HasAnimDictLoaded(dict) and attempts < 200 do
-        Wait(10)
-        attempts = attempts + 1
-    end
-    return HasAnimDictLoaded(dict)
-end
-
----------------------------------------------
--- helper: load model
----------------------------------------------
-local function LoadModel(model)
-    local hash = type(model) == 'string' and GetHashKey(model) or model
-    if not IsModelInCdimage(hash) then return false end
-    RequestModel(hash)
-    local attempts = 0
-    while not HasModelLoaded(hash) and attempts < 100 do
-        Wait(10)
-        attempts = attempts + 1
-    end
-    return HasModelLoaded(hash)
-end
-
----------------------------------------------
--- helper: remove an auto-attached scenario prop (e.g. the bucket that
--- WORLD_HUMAN_BUCKET_POUR_LOW spawns on its own). ClearPedTasks does not
--- reliably despawn scenario-owned props, so we hunt it down and delete it.
----------------------------------------------
 local ScenarioBucketModels = { `p_bucket03x`, `p_bucket01x`, `p_cs_bucket01x`, `p_cs_bucket01bx` }
 
+
+---------------------------------------------
+-- helpers
+---------------------------------------------
+--- WORLD_HUMAN_BUCKET_POUR_LOW spawns its own bucket which ClearPedTasks does not remove
 local function RemoveScenarioBucketProp(ped)
-    Wait(100) -- let the scenario/task teardown finish before touching the prop
+    Wait(100)
     local pos = GetEntityCoords(ped)
     for i = 1, #ScenarioBucketModels do
         local obj = GetClosestObjectOfType(pos.x, pos.y, pos.z, 1.5, ScenarioBucketModels[i], false, false, false)
-        if obj and obj ~= 0 and DoesEntityExist(obj) then
-            if IsEntityAttachedToEntity(obj, ped) then
-                DetachEntity(obj, true, false)
-            end
+        if obj ~= 0 and DoesEntityExist(obj) then
+            if IsEntityAttachedToEntity(obj, ped) then DetachEntity(obj, true, false) end
             SetEntityAsMissionEntity(obj, false, false)
             DeleteObject(obj)
         end
     end
-    -- force a full task/control reset in case the scenario left movement disabled
     ClearPedTasksImmediately(ped)
 end
 
----------------------------------------------
--- helper: get prop data by id
----------------------------------------------
-local function GetPropDataById(propid)
-    for i = 1, #Config.PlayerProps do
-        if Config.PlayerProps[i].id == propid then
-            return Config.PlayerProps[i]
-        end
-    end
-    return nil
+local function PlaySmoke(propid)
+    local sp = SpawnedProps[propid]
+    if not sp or not DoesEntityExist(sp.obj) then return end
+    local c = GetEntityCoords(sp.obj)
+    UseParticleFxAsset(FX_GROUP)
+    StartParticleFxNonLoopedAtCoord(FX_NAME, c.x, c.y, c.z, 0.0, 0.0, 0.0, 1.0, false, false, false, true)
+end
+
+local function GetRockerData(propid)
+    return lib.callback.await('rsg-goldclaim:server:getrockerdata', false, propid)
+end
+
+local function IsOwner(propid)
+    local p = PropsById[propid]
+    return p ~= nil and p.builder == RSGCore.Functions.GetPlayerData().citizenid
 end
 
 ---------------------------------------------
--- spawn rocker props
+-- rocker props (streamed in / out by distance)
 ---------------------------------------------
-Citizen.CreateThread(function()
-    while true do
-        Wait(150)
+local function RemoveVegModifier(propid)
+    local handle = VegModifiers[propid]
+    if handle then
+        Citizen.InvokeNative(0x9CF1836C03FB67A2, handle, 0) -- RemoveVegModifierSphere
+        VegModifiers[propid] = nil
+    end
+end
 
+local function DespawnRocker(propid)
+    local sp = SpawnedProps[propid]
+    if not sp then return end
+    if DoesEntityExist(sp.obj) then
+        exports.ox_target:removeLocalEntity(sp.obj)
+        SetEntityAsMissionEntity(sp.obj, false, false)
+        DeleteObject(sp.obj)
+    end
+    SpawnedProps[propid] = nil
+end
+
+local function SetupRockerTarget(propid, obj)
+    exports.ox_target:addLocalEntity(obj, {
+        {
+            name = 'rocker_menu_' .. propid,
+            label = locale('rocker_target_menu'),
+            icon = 'fa-solid fa-bars',
+            distance = 3.0,
+            onSelect = function() TriggerEvent('rsg-goldclaim:rocker:client:mainmenu', propid) end,
+        },
+        {
+            name = 'add_paydirt_' .. propid,
+            label = locale('rocker_target_add_paydirt'),
+            icon = 'fa-solid fa-hill-rockslide',
+            distance = 3.0,
+            onSelect = function() TriggerEvent('rsg-goldclaim:rocker:client:addpaydirt', propid) end,
+        },
+        {
+            name = 'add_water_' .. propid,
+            label = locale('rocker_target_add_water'),
+            icon = 'fa-solid fa-droplet',
+            distance = 3.0,
+            onSelect = function() TriggerEvent('rsg-goldclaim:rocker:client:addwater', propid) end,
+        },
+        {
+            name = 'destroy_illegal_' .. propid,
+            label = locale('rocker_destroy_illegal'),
+            icon = 'fa-solid fa-gavel',
+            distance = 3.0,
+            -- evaluated live, so job changes and licence state are always current
+            canInteract = function()
+                local p = PropsById[propid]
+                return p ~= nil and p.licensed ~= 1 and IsLeo()
+            end,
+            onSelect = function() TriggerEvent('rsg-goldclaim:rocker:client:destroyillegal', propid) end,
+        },
+    })
+end
+
+local function SpawnRocker(p)
+    if not LoadModel(Config.GoldRocker) then return end
+
+    local obj = CreateObject(Config.GoldRocker, p.x, p.y, p.z - 1.2, false, false, false)
+    SetEntityHeading(obj, p.h or 0.0)
+    SetEntityAsMissionEntity(obj, true, true)
+    PlaceObjectOnGroundProperly(obj)
+    FreezeEntityPosition(obj, true)
+    SetModelAsNoLongerNeeded(Config.GoldRocker)
+
+    -- add the vegetation modifier only once per rocker (re-adding on every stream-in stacked them up)
+    if Config.EnableVegModifier and not VegModifiers[p.id] then
+        VegModifiers[p.id] = Citizen.InvokeNative(0xFA50F79257745E74, p.x, p.y, p.z, 3.0, 1, 511, 0) -- AddVegModifierSphere
+    end
+
+    SpawnedProps[p.id] = { obj = obj }
+    SetupRockerTarget(p.id, obj)
+end
+
+CreateThread(function()
+    while true do
         local pos = GetEntityCoords(cache.ped)
-        local InRange = false
+        local sleep = 3000
 
         for i = 1, #Config.PlayerProps do
-            local prop = vector3(Config.PlayerProps[i].x, Config.PlayerProps[i].y, Config.PlayerProps[i].z)
-            local dist = #(pos - prop)
-            if dist >= 50.0 then goto continue end
-
-            local hasSpawned = false
-            InRange = true
-
-            for z = 1, #SpawnedProps do
-                if SpawnedProps[z].id == Config.PlayerProps[i].id then
-                    hasSpawned = true
-                end
+            local p = Config.PlayerProps[i]
+            local dist = #(pos - vector3(p.x, p.y, p.z))
+            if dist < Config.PropDrawDistance then
+                sleep = 1000
+                if not SpawnedProps[p.id] then SpawnRocker(p) end
+            elseif SpawnedProps[p.id] and dist > Config.PropDrawDistance + 15.0 then
+                DespawnRocker(p.id)
             end
-
-            if hasSpawned then goto continue end
-
-            local modelHash = Config.PlayerProps[i].hash
-            local data = {}
-
-            if not HasModelLoaded(modelHash) then
-                RequestModel(modelHash)
-                while not HasModelLoaded(modelHash) do
-                    Wait(1)
-                end
-            end
-
-            data.id = Config.PlayerProps[i].id
-            data.obj = CreateObject(modelHash, Config.PlayerProps[i].x, Config.PlayerProps[i].y, Config.PlayerProps[i].z - 1.2, false, false, false)
-            SetEntityHeading(data.obj, Config.PlayerProps[i].h)
-            SetEntityAsMissionEntity(data.obj, true)
-            PlaceObjectOnGroundProperly(data.obj)
-            Wait(1000)
-            FreezeEntityPosition(data.obj, true)
-            SetModelAsNoLongerNeeded(data.obj)
-
-            -- vegetation modifier
-            if Config.EnableVegModifier then
-                local veg_radius = 3.0
-                local veg_Flags = 1 + 2 + 4 + 8 + 16 + 32 + 64 + 128 + 256
-                local veg_ModType = 1
-                Citizen.InvokeNative(0xFA50F79257745E74, Config.PlayerProps[i].x, Config.PlayerProps[i].y, Config.PlayerProps[i].z, veg_radius, veg_ModType, veg_Flags, 0)
-            end
-
-            -- store reference
-            data.licensed = Config.PlayerProps[i].licensed or 0
-            data.claimname = Config.PlayerProps[i].claimname or ''
-            data.citizenid = Config.PlayerProps[i].builder or ''
-            SpawnedProps[#SpawnedProps + 1] = data
-
-            -- create ox_target for the rocker entity
-            SetupRockerTarget(data)
-
-            ::continue::
         end
 
-        if not InRange then
-            Wait(5000)
+        Wait(sleep)
+    end
+end)
+
+---------------------------------------------
+-- claim zones & blips (single thread for all licensed claims)
+---------------------------------------------
+local function RemoveClaimZone(propid)
+    local z = ClaimZones[propid]
+    if not z then return end
+    if z.blip then RemoveBlip(z.blip) end
+    ClaimZones[propid] = nil
+end
+
+local function SetupClaimZone(p)
+    local wasInside = ClaimZones[p.id] and ClaimZones[p.id].inside or false
+    RemoveClaimZone(p.id)
+    local coords = vector3(p.x, p.y, p.z)
+    ClaimZones[p.id] = {
+        coords = coords,
+        name   = p.claimname,
+        inside = wasInside,
+        blip   = CreateNamedBlip(coords, Config.ClaimBlip.blipSprite, Config.ClaimBlip.blipScale, p.claimname, Config.ClaimBlip.blipColour),
+    }
+end
+
+local function SyncClaimZones()
+    local keep = {}
+    for i = 1, #Config.PlayerProps do
+        local p = Config.PlayerProps[i]
+        if p.licensed == 1 and p.claimname and p.claimname ~= '' then
+            keep[p.id] = true
+            local z = ClaimZones[p.id]
+            if not z or z.name ~= p.claimname then SetupClaimZone(p) end
+        end
+    end
+    for propid in pairs(ClaimZones) do
+        if not keep[propid] then RemoveClaimZone(propid) end
+    end
+end
+
+CreateThread(function()
+    while true do
+        Wait(500)
+        local pos = GetEntityCoords(cache.ped)
+        for _, z in pairs(ClaimZones) do
+            local inside = #(pos - z.coords) <= Config.ClaimZoneRadius
+            if inside ~= z.inside then
+                z.inside = inside
+                lib.notify({
+                    title       = z.name,
+                    description = locale(inside and 'rocker_entering_claim_desc' or 'rocker_leaving_claim_desc', z.name),
+                    type        = 'inform',
+                    icon        = 'coins',
+                    position    = Config.NotifyPosition,
+                    duration    = inside and 7000 or 5000,
+                })
+            end
         end
     end
 end)
 
 ---------------------------------------------
--- setup ox_target on rocker
+-- prop data sync
 ---------------------------------------------
-function SetupRockerTarget(data)
+local function SetPropData(data)
+    Config.PlayerProps = data or {}
+    PropsById = {}
+    for i = 1, #Config.PlayerProps do
+        PropsById[Config.PlayerProps[i].id] = Config.PlayerProps[i]
+    end
+    for propid in pairs(SpawnedProps) do
+        if not PropsById[propid] then DespawnRocker(propid) end
+    end
+    for propid in pairs(VegModifiers) do
+        if not PropsById[propid] then RemoveVegModifier(propid) end
+    end
+    SyncClaimZones()
+end
+
+RegisterNetEvent('rsg-goldclaim:rocker:client:updatePropData', SetPropData)
+
+local function ClearOutputProps(rockerid)
+    for outputId, o in pairs(SpawnedOutputProps) do
+        if not rockerid or o.rockerid == rockerid then
+            if DoesEntityExist(o.obj) then
+                exports.ox_target:removeLocalEntity(o.obj)
+                DeleteObject(o.obj)
+            end
+            SpawnedOutputProps[outputId] = nil
+        end
+    end
+end
+
+local function RequestProps()
+    ClearOutputProps() -- character switch: drop the previous character's outputs
+    SetPropData(lib.callback.await('rsg-goldclaim:server:getprops', false))
+    -- respawn any outputs the server still holds for this character (relog / resource restart)
+    for _, p in ipairs(lib.callback.await('rsg-goldclaim:server:getpending', false) or {}) do
+        for _ = 1, p.gold do TriggerEvent('rsg-goldclaim:rocker:client:spawnoutputprop', p.propid, 'gold', true) end
+        for _ = 1, p.paydirt do TriggerEvent('rsg-goldclaim:rocker:client:spawnoutputprop', p.propid, 'paydirt', true) end
+    end
+end
+
+RegisterNetEvent('RSGCore:Client:OnPlayerLoaded', RequestProps)
+
+AddEventHandler('onClientResourceStart', function(resource)
+    if resource ~= GetCurrentResourceName() then return end
+    if LocalPlayer.state.isLoggedIn then RequestProps() end
+end)
+
+RegisterNetEvent('rsg-goldclaim:rocker:client:removePropObject', function(propid)
+    DespawnRocker(propid)
+    RemoveVegModifier(propid)
+    RemoveClaimZone(propid)
+    ClearOutputProps(propid)
+    if PropsById[propid] then
+        for i = #Config.PlayerProps, 1, -1 do
+            if Config.PlayerProps[i].id == propid then table.remove(Config.PlayerProps, i) end
+        end
+        PropsById[propid] = nil
+    end
+end)
+
+RegisterNetEvent('rsg-goldclaim:rocker:client:refreshclaim', function(propid, newname)
+    local p = PropsById[propid]
+    if not p then return end
+    p.claimname = newname
+    SyncClaimZones()
+end)
+
+---------------------------------------------
+-- main menu
+---------------------------------------------
+RegisterNetEvent('rsg-goldclaim:rocker:client:mainmenu', function(propid)
+    local result = GetRockerData(propid)
+    if not result then return end
+
+    local isOwner = IsOwner(propid)
+    local args = { rockerid = propid }
     local options = {
-        {
-            name = 'rocker_menu_' .. data.id,
-            label = locale('rocker_target_menu'),
-            icon = 'fa-solid fa-bars',
-            distance = 3.0,
-            onSelect = function()
-                TriggerEvent('rsg-goldclaim:rocker:client:mainmenu', data.id)
-            end,
-        },
-        {
-            name = 'add_paydirt_' .. data.id,
-            label = locale('rocker_target_add_paydirt'),
-            icon = 'fa-solid fa-hill-rockslide',
-            distance = 3.0,
-            onSelect = function()
-                TriggerEvent('rsg-goldclaim:rocker:client:addpaydirt', data.id)
-            end,
-        },
-        {
-            name = 'add_water_' .. data.id,
-            label = locale('rocker_target_add_water'),
-            icon = 'fa-solid fa-droplet',
-            distance = 3.0,
-            onSelect = function()
-                TriggerEvent('rsg-goldclaim:rocker:client:addwater', data.id)
-            end,
-        },
+        { title = locale('rocker_equipment_info'), icon = 'fa-solid fa-circle-info', event = 'rsg-goldclaim:rocker:client:checkrocker', args = args, arrow = true },
     }
 
-    -- LEO destroy option for unlicensed claims
-    if data.licensed == 0 then
-        local PlayerData = RSGCore.Functions.GetPlayerData()
-        if PlayerData and PlayerData.job and PlayerData.job.type == 'leo' then
-            options[#options + 1] = {
-                name = 'destroy_illegal_' .. data.id,
-                label = locale('rocker_destroy_illegal'),
-                icon = 'fa-solid fa-gavel',
-                distance = 3.0,
-                onSelect = function()
-                    TriggerEvent('rsg-goldclaim:rocker:client:destroyillegal', data.id, data.obj)
-                end,
-            }
-        end
-    end
-
-    exports.ox_target:addLocalEntity(data.obj, options)
-end
-
----------------------------------------------
--- setup claim zone (licensed claims only)
----------------------------------------------
-function SetupClaimZone(propData)
-    local zoneId = 'goldclaim_' .. propData.id
-
-    -- stop existing zone thread if any
-    if ActiveZones[zoneId] then
-        ActiveZones[zoneId].active = false
-        ActiveZones[zoneId] = nil
-    end
-
-    -- capture values for the thread
-    local claimname = propData.claimname or 'Gold Claim'
-    local zoneCoords = vector3(propData.x, propData.y, propData.z)
-    local zoneRadius = Config.ClaimZoneRadius
-    local propId = propData.id
-
-    -- zone state tracker
-    local zoneData = { active = true, inside = false }
-    ActiveZones[zoneId] = zoneData
-
-    -- distance check thread (works for ALL players, including owner)
-    Citizen.CreateThread(function()
-        while zoneData.active do
-            Wait(500)
-            local playerPos = GetEntityCoords(cache.ped)
-            local dist = #(playerPos - zoneCoords)
-
-            if dist <= zoneRadius and not zoneData.inside then
-                -- entered zone
-                zoneData.inside = true
-                lib.notify({
-                    title = claimname,
-                    description = locale('rocker_entering_claim_desc', claimname),
-                    type = 'info',
-                    icon = 'coins',
-                    position = 'center-left',
-                    duration = 7000,
-                })
-            elseif dist > zoneRadius and zoneData.inside then
-                -- left zone
-                zoneData.inside = false
-                lib.notify({
-                    title = claimname,
-                    description = locale('rocker_leaving_claim_desc', claimname),
-                    type = 'info',
-                    icon = 'coins',
-                    position = 'center-left',
-                    duration = 5000,
-                })
-            end
-        end
-    end)
-
-    -- create blip
-    if ActiveBlips[propId] then
-        RemoveBlip(ActiveBlips[propId])
-        ActiveBlips[propId] = nil
-    end
-
-    local blip = Citizen.InvokeNative(0x554D9D53F696D002, 1664425300, zoneCoords)
-    SetBlipSprite(blip, joaat(Config.ClaimBlip.blipSprite), true)
-    SetBlipScale(blip, Config.ClaimBlip.blipScale)
-    Citizen.InvokeNative(0x9CB1A1623062F402, blip, claimname)
-    Citizen.InvokeNative(0x662D364ABF16DE2F, blip, joaat(Config.ClaimBlip.blipColour))
-    ActiveBlips[propId] = blip
-end
-
----------------------------------------------
--- main menu (custom NUI context menu)
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:mainmenu', function(rockerid)
-    RSGCore.Functions.TriggerCallback('rsg-goldclaim:rocker:server:getrockerdata', function(result)
-        if not result then return end
-
-        local quality = result.quality
-        local licensed = result.licensed
-        local claimname = result.claimname or ''
-        local citizenid = result.citizenid
-        local owner = result.owner
-        local water = result.water
-        local paydirt = result.paydirt
-
-        local PlayerData = RSGCore.Functions.GetPlayerData()
-        local isOwner = PlayerData.citizenid == citizenid
-        local isLeo = PlayerData.job and PlayerData.job.type == 'leo'
-
-        local menuOptions = {
-            {
-                title = locale('rocker_equipment_info'),
-                icon = 'fa-solid fa-circle-info',
-                event = 'rsg-goldclaim:rocker:client:checkrocker',
-                args = { rockerid = rockerid },
-                arrow = true,
-            },
-            {
-                title = locale('rocker_start_processing'),
-                icon = 'fa-solid fa-cogs',
-                event = 'rsg-goldclaim:rocker:client:startprocessing',
-                args = { rockerid = rockerid },
-            },
-            {
-                title = locale('rocker_repair_equipment'),
-                icon = 'fa-solid fa-screwdriver-wrench',
-                event = 'rsg-goldclaim:rocker:client:repairrocker',
-                args = { rockerid = rockerid },
-            },
+    if isOwner or not Config.OwnerOnlyProcessing then
+        options[#options + 1] = {
+            title = locale('rocker_start_processing'),
+            description = result.processing and locale('rocker_already_processing_desc') or nil,
+            icon = 'fa-solid fa-cogs',
+            event = 'rsg-goldclaim:rocker:client:startprocessing',
+            args = args,
+            disabled = result.processing,
         }
+    end
 
-        -- rename option (licensed + owner only)
-        if licensed == 1 and isOwner then
-            menuOptions[#menuOptions + 1] = {
-                title = locale('rocker_rename_claim'),
-                icon = 'fa-solid fa-pen',
-                event = 'rsg-goldclaim:rocker:client:renameclaim',
-                args = { rockerid = rockerid },
-            }
-        end
+    options[#options + 1] = {
+        title = locale('rocker_repair_equipment', Config.RepairWoodAmount),
+        icon = 'fa-solid fa-screwdriver-wrench',
+        event = 'rsg-goldclaim:rocker:client:repairrocker',
+        args = args,
+        disabled = result.quality >= 100,
+    }
 
-        -- pack up (owner only)
-        if isOwner then
-            menuOptions[#menuOptions + 1] = {
-                title = locale('rocker_packup_equipment'),
-                icon = 'fa-solid fa-box-open',
-                event = 'rsg-goldclaim:rocker:client:packuprocker',
-                args = { rockerid = rockerid },
-            }
-        end
+    if isOwner and result.licensed == 1 then
+        options[#options + 1] = { title = locale('rocker_rename_claim'), icon = 'fa-solid fa-pen', event = 'rsg-goldclaim:rocker:client:renameclaim', args = args }
+    end
 
-        -- LEO destroy (unlicensed only)
-        if licensed == 0 and isLeo then
-            menuOptions[#menuOptions + 1] = {
-                title = locale('rocker_destroy_illegal'),
-                icon = 'fa-solid fa-gavel',
-                event = 'rsg-goldclaim:rocker:client:destroyillegal',
-                args = { rockerid = rockerid },
-            }
-        end
+    if isOwner then
+        options[#options + 1] = {
+            title = locale('rocker_packup_equipment'),
+            description = result.quality < 100 and locale('rocker_needs_repair') or nil,
+            icon = 'fa-solid fa-box-open',
+            event = 'rsg-goldclaim:rocker:client:packuprocker',
+            args = args,
+            disabled = result.quality < 100,
+        }
+    end
 
-        OpenContext({
-            id = 'goldclaim_main_menu',
-            title = locale('rocker_menu'),
-            position = 'top-right',
-            options = menuOptions,
-        })
-        ShowContext('goldclaim_main_menu')
+    if result.licensed == 0 and IsLeo() then
+        options[#options + 1] = { title = locale('rocker_destroy_illegal'), icon = 'fa-solid fa-gavel', event = 'rsg-goldclaim:rocker:client:destroyillegal', args = args }
+    end
 
-    end, rockerid)
+    OpenContext({
+        id = 'goldclaim_main_menu',
+        title = result.claimname or locale('rocker_menu'),
+        subtitle = locale('rocker_menu'),
+        options = options,
+    })
+    ShowContext('goldclaim_main_menu')
 end)
 
 ---------------------------------------------
 -- equipment info
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:client:checkrocker', function(data)
-    RSGCore.Functions.TriggerCallback('rsg-goldclaim:rocker:server:getrockerdata', function(result)
-        if not result then return end
+    local result = GetRockerData(data.rockerid)
+    if not result then return end
 
-        local statusText = result.licensed == 1 and locale('rocker_info_licensed') or locale('rocker_info_unlicensed')
+    local status = locale(result.licensed == 1 and 'rocker_info_licensed' or 'rocker_info_unlicensed')
 
-        local options = {
-            {
-                title = locale('rocker_info_id', result.propid),
-                icon = 'fa-solid fa-fingerprint',
-            },
-            {
-                title = locale('rocker_info_owner', result.owner, result.citizenid),
-                icon = 'fa-solid fa-user',
-            },
-            {
-                title = locale('rocker_info_condition', result.quality),
-                progress = result.quality,
-                colorScheme = 'green',
-                icon = 'fa-solid fa-screwdriver-wrench',
-            },
-            {
-                title = locale('rocker_info_water', result.water, Config.MaxWater),
-                progress = (result.water / Config.MaxWater) * 100,
-                colorScheme = 'blue',
-                icon = 'fa-solid fa-droplet',
-            },
-            {
-                title = locale('rocker_info_paydirt', result.paydirt, Config.MaxPaydirt),
-                progress = (result.paydirt / Config.MaxPaydirt) * 100,
-                colorScheme = 'orange',
-                icon = 'fa-solid fa-hill-rockslide',
-            },
-            {
-                title = locale('rocker_info_claim', result.claimname or 'N/A', statusText),
-                icon = 'fa-solid fa-scroll',
-            },
-        }
-
-        OpenContext({
-            id = 'goldclaim_info',
-            title = locale('rocker_info_title'),
-            menu = 'goldclaim_main_menu',
-            onBack = function() end,
-            options = options,
-        })
-        ShowContext('goldclaim_info')
-
-    end, data.rockerid)
+    OpenContext({
+        id = 'goldclaim_info',
+        title = locale('rocker_info_title'),
+        menu = 'goldclaim_main_menu',
+        options = {
+            { title = locale('rocker_info_id', result.propid), icon = 'fa-solid fa-fingerprint' },
+            { title = locale('rocker_info_owner', result.owner), icon = 'fa-solid fa-user' },
+            { title = locale('rocker_info_condition', result.quality), progress = result.quality, colorScheme = 'green', icon = 'fa-solid fa-screwdriver-wrench' },
+            { title = locale('rocker_info_water', result.water, Config.MaxWater), progress = result.water / Config.MaxWater * 100, colorScheme = 'blue', icon = 'fa-solid fa-droplet' },
+            { title = locale('rocker_info_paydirt', result.paydirt, Config.MaxPaydirt), progress = result.paydirt / Config.MaxPaydirt * 100, colorScheme = 'orange', icon = 'fa-solid fa-hill-rockslide' },
+            { title = locale('rocker_info_claim', result.claimname or locale('rocker_info_none'), status), icon = 'fa-solid fa-scroll' },
+        },
+    })
+    ShowContext('goldclaim_info')
 end)
 
 ---------------------------------------------
--- add paydirt to rocker
+-- add paydirt / water
 ---------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:addpaydirt', function(rockerid)
-    if isBusy then
-        Notify(locale('rocker_processing_busy'), nil, 'cross', 3000, 'ERROR')
-        return
+RegisterNetEvent('rsg-goldclaim:rocker:client:addpaydirt', function(propid)
+    if IsBusy() then return end
+    if not RSGCore.Functions.HasItem('resource_paydirt', 1) then
+        return Notify(locale('rocker_no_paydirt'), nil, 'error', 'circle-xmark')
     end
 
-    local hasItem = RSGCore.Functions.HasItem('paydirt', 1)
-    if not hasItem then
-        Notify(locale('rocker_no_paydirt'), nil, 'cross', 5000, 'ERROR')
-        return
-    end
-
-    isBusy = true
-    LocalPlayer.state:set("inv_busy", true, true)
-
-    local ped = PlayerPedId()
-    FreezeEntityPosition(ped, true)
-    local anim = Config.Anims.add_paydirt
-    TaskStartScenarioInPlace(ped, anim, 0, true)
-
-    if lib.progressBar({
+    if DoTimedAction({
         duration = Config.AddPaydirtTime,
-        position = 'bottom',
-        useWhileDead = false,
-        canCancel = true,
-        disable = { move = true, car = true, combat = true },
-        label = locale('rocker_adding_paydirt'),
+        scenario = Config.Anims.add_paydirt,
+        onCleanup = RemoveScenarioBucketProp,
     }) then
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-        RemoveScenarioBucketProp(ped)
-        TriggerServerEvent('rsg-goldclaim:rocker:server:addpaydirt', rockerid)
-        Notify(locale('rocker_paydirt_added'), nil, 'tick', 3000, 'SUCCESS')
-    else
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-        RemoveScenarioBucketProp(ped)
+        TriggerServerEvent('rsg-goldclaim:rocker:server:addpaydirt', propid)
     end
-
-    LocalPlayer.state:set("inv_busy", false, true)
-    isBusy = false
 end)
 
----------------------------------------------
--- add water to rocker (requires fullbucket)
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:addwater', function(rockerid)
-    if isBusy then
-        Notify(locale('rocker_processing_busy'), nil, 'cross', 3000, 'ERROR')
-        return
+RegisterNetEvent('rsg-goldclaim:rocker:client:addwater', function(propid)
+    if IsBusy() then return end
+    if not RSGCore.Functions.HasItem('tool_rocker_bucket_full', 1) then
+        return Notify(locale('rocker_no_fullbucket'), nil, 'error', 'circle-xmark')
     end
 
-    local hasItem = RSGCore.Functions.HasItem('fullbucket', 1)
-    if not hasItem then
-        Notify(locale('rocker_no_fullbucket'), nil, 'cross', 5000, 'ERROR')
-        return
-    end
-
-    isBusy = true
-    LocalPlayer.state:set("inv_busy", true, true)
-
-    local ped = PlayerPedId()
-    FreezeEntityPosition(ped, true)
-    local anim = Config.Anims.add_water
-    TaskStartScenarioInPlace(ped, anim, 0, true)
-
-    if lib.progressBar({
+    if DoTimedAction({
         duration = Config.AddWaterTime,
-        position = 'bottom',
-        useWhileDead = false,
-        canCancel = true,
-        disable = { move = true, car = true, combat = true },
-        label = locale('rocker_adding_water'),
+        scenario = Config.Anims.add_water,
+        onCleanup = RemoveScenarioBucketProp,
     }) then
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-        RemoveScenarioBucketProp(ped)
-        TriggerServerEvent('rsg-goldclaim:rocker:server:addwater', rockerid)
-        Notify(locale('rocker_water_added'), nil, 'tick', 3000, 'SUCCESS')
-    else
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-        RemoveScenarioBucketProp(ped)
+        TriggerServerEvent('rsg-goldclaim:rocker:server:addwater', propid)
     end
-
-    LocalPlayer.state:set("inv_busy", false, true)
-    isBusy = false
 end)
 
 ---------------------------------------------
--- start processing (async - player is free to move)
+-- start processing (server runs the cycles)
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:client:startprocessing', function(data)
-    RSGCore.Functions.TriggerCallback('rsg-goldclaim:rocker:server:getrockerdata', function(result)
-        if not result then return end
+    TriggerServerEvent('rsg-goldclaim:rocker:server:processrocker', data.rockerid)
+end)
 
-        if result.water <= 0 then
-            Notify(locale('rocker_processing_no_water'), nil, 'cross', 5000, 'ERROR')
-            return
-        end
-
-        if result.paydirt <= 0 then
-            Notify(locale('rocker_processing_no_paydirt'), nil, 'cross', 5000, 'ERROR')
-            return
-        end
-
-        -- tell server to start processing (server handles the loop)
-        local cycles = math.min(result.water, result.paydirt)
-        HideContext()
-        TriggerServerEvent('rsg-goldclaim:rocker:server:processrocker', data.rockerid)
-        Notify(locale('rocker_processing_started'), locale('rocker_processing_will_run', cycles), 'leaderboard_gold', 5000, 'INFO')
-
-    end, data.rockerid)
+RegisterNetEvent('rsg-goldclaim:rocker:client:processingcomplete', function()
+    Notify(locale('rocker_processing_complete_title'), locale('rocker_processing_complete_desc'), 'inform', 'coins', 7000)
 end)
 
 ---------------------------------------------
--- spawn output prop (triggered by server)
+-- output props
 ---------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:spawnoutputprop', function(rockerid, resultType)
-    local propData = GetPropDataById(rockerid)
-    if not propData then return end
+local function PickupOutput(outputId, serverEvent)
+    local o = SpawnedOutputProps[outputId]
+    if not o or IsBusy() then return end
 
-    local rockerPos = vector3(propData.x, propData.y, propData.z)
+    if DoTimedAction({
+        duration = Config.PickupTime,
+        scenario = Config.Anims.crouch_inspect,
+        canCancel = true,
+    }) then
+        if DoesEntityExist(o.obj) then
+            exports.ox_target:removeLocalEntity(o.obj)
+            DeleteObject(o.obj)
+        end
+        SpawnedOutputProps[outputId] = nil
+        TriggerServerEvent(serverEvent, o.rockerid)
+    end
+end
 
-    -- calculate offset position to the side of the rocker
-    local heading = math.rad(propData.h or 0)
-    local offsetX = rockerPos.x + (Config.PropSpawnOffset * math.cos(heading + math.pi / 2))
-    local offsetY = rockerPos.y + (Config.PropSpawnOffset * math.sin(heading + math.pi / 2))
-    local spawnPos = vector3(offsetX, offsetY, rockerPos.z)
+local outputCounter = 0
 
-    local propHash, targetLabel, targetEvent
+RegisterNetEvent('rsg-goldclaim:rocker:client:spawnoutputprop', function(propid, resultType, silent)
+    local p = PropsById[propid]
+    if not p then return end
 
-    if resultType == 'gold' then
-        propHash = Config.GoldProp
-        targetLabel = locale('rocker_target_pickup_gold')
-        targetEvent = 'rsg-goldclaim:rocker:client:pickupgold'
-        Notify(locale('rocker_processing_gold_title'), locale('rocker_processing_gold_desc'), 'leaderboard_gold', 5000, 'SUCCESS')
+    local isGold = resultType == 'gold'
+    local model = isGold and Config.GoldProp or Config.PaydirtProp
+
+    if silent then
+        -- respawned (inventory was full / relog), no "found" notification
+    elseif isGold then
+        Notify(locale('rocker_processing_gold_title'), locale('rocker_processing_gold_desc'), 'success', 'coins')
     else
-        propHash = Config.PaydirtProp
-        targetLabel = locale('rocker_target_pickup_paydirt')
-        targetEvent = 'rsg-goldclaim:rocker:client:pickuppaydirt'
-        Notify(locale('rocker_processing_paydirt_title'), locale('rocker_processing_paydirt_desc'), 'awards_set_c_001', 5000, 'INFO')
+        Notify(locale('rocker_processing_paydirt_title'), locale('rocker_processing_paydirt_desc'), 'inform', 'box-open')
     end
 
-    if not LoadModel(propHash) then
-        if Config.Debug then print('[rsg-goldclaim] Failed to load output prop model') end
-        return
-    end
+    if not LoadModel(model) then return end
 
-    local obj = CreateObject(propHash, spawnPos.x, spawnPos.y, spawnPos.z, false, true, false)
+    -- offset to the side of the rocker, with a little jitter so stacked outputs don't overlap
+    local heading = math.rad(p.h or 0.0) + math.pi / 2 + (math.random() - 0.5) * 0.6
+    local dist = Config.PropSpawnOffset + math.random() * 0.5
+    local x = p.x + dist * math.cos(heading)
+    local y = p.y + dist * math.sin(heading)
+
+    local obj = CreateObject(model, x, y, p.z, false, false, false)
     PlaceObjectOnGroundProperly(obj)
-    Wait(300)
     FreezeEntityPosition(obj, true)
-    SetModelAsNoLongerNeeded(propHash)
+    SetModelAsNoLongerNeeded(model)
 
-    -- store reference
-    local outputId = rockerid .. '_' .. GetGameTimer()
-    SpawnedOutputProps[outputId] = obj
+    outputCounter = outputCounter + 1
+    local outputId = ('%s_%s'):format(propid, outputCounter)
+    SpawnedOutputProps[outputId] = { obj = obj, rockerid = propid }
 
-    -- add ox_target to pick up
     exports.ox_target:addLocalEntity(obj, {
         {
             name = 'pickup_' .. outputId,
-            label = targetLabel,
+            label = locale(isGold and 'rocker_target_pickup_gold' or 'rocker_target_pickup_paydirt'),
             icon = 'fa-solid fa-hand',
             distance = 3.0,
             onSelect = function()
-                TriggerEvent(targetEvent, outputId, rockerid)
+                PickupOutput(outputId, isGold and 'rsg-goldclaim:rocker:server:pickupgold' or 'rsg-goldclaim:rocker:server:pickuppaydirt')
             end,
         },
     })
 end)
 
----------------------------------------------
--- pick up gold prop
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:pickupgold', function(outputId, rockerid)
-    if isBusy then return end
-    isBusy = true
-
-    local ped = PlayerPedId()
-    FreezeEntityPosition(ped, true)
-    TaskStartScenarioInPlace(ped, Config.Anims.crouch_inspect, 0, true)
-
-    if lib.progressBar({
-        duration = 3000,
-        position = 'bottom',
-        useWhileDead = false,
-        canCancel = false,
-        disable = { move = true, car = true, combat = true },
-        label = locale('rocker_picking_up'),
-    }) then
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-
-        -- delete the prop
-        local obj = SpawnedOutputProps[outputId]
-        if obj and DoesEntityExist(obj) then
-            exports.ox_target:removeLocalEntity(obj)
-            DeleteObject(obj)
-        end
-        SpawnedOutputProps[outputId] = nil
-
-        -- server gives random nugget and sends back the result
-        TriggerServerEvent('rsg-goldclaim:rocker:server:pickupgold', rockerid)
-    else
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-    end
-
-    isBusy = false
+RegisterNetEvent('rsg-goldclaim:rocker:client:goldpickupresult', function(amount)
+    local label = locale('rocker_gold_nugget')
+    Notify(locale('rocker_gold_pickedup_title'), locale('rocker_gold_pickedup_desc', amount, label), 'success', 'coins', 7000)
 end)
 
 ---------------------------------------------
--- gold pickup result notification
----------------------------------------------
-local NuggetLabelKeys = {
-    smallnugget  = 'rocker_nugget_small',
-    mediumnugget = 'rocker_nugget_medium',
-    largenugget  = 'rocker_nugget_large',
-}
-
-RegisterNetEvent('rsg-goldclaim:rocker:client:goldpickupresult', function(nuggetType, amount)
-    local label = NuggetLabelKeys[nuggetType] and locale(NuggetLabelKeys[nuggetType]) or nuggetType
-    Notify(
-        locale('rocker_gold_pickedup_title'),
-        locale('rocker_gold_pickedup_desc', amount, label),
-        'leaderboard_gold',
-        7000,
-        'TIP_GOLD'
-    )
-end)
-
----------------------------------------------
--- pick up paydirt prop
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:pickuppaydirt', function(outputId, rockerid)
-    if isBusy then return end
-    isBusy = true
-
-    local ped = PlayerPedId()
-    FreezeEntityPosition(ped, true)
-    TaskStartScenarioInPlace(ped, Config.Anims.crouch_inspect, 0, true)
-
-    if lib.progressBar({
-        duration = 3000,
-        position = 'bottom',
-        useWhileDead = false,
-        canCancel = false,
-        disable = { move = true, car = true, combat = true },
-        label = locale('rocker_picking_up'),
-    }) then
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-
-        local obj = SpawnedOutputProps[outputId]
-        if obj and DoesEntityExist(obj) then
-            exports.ox_target:removeLocalEntity(obj)
-            DeleteObject(obj)
-        end
-        SpawnedOutputProps[outputId] = nil
-
-        TriggerServerEvent('rsg-goldclaim:rocker:server:pickuppaydirt', rockerid)
-    else
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-    end
-
-    isBusy = false
-end)
-
----------------------------------------------
--- repair rocker (5x wood)
+-- repair
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:client:repairrocker', function(data)
-    if isBusy then return end
+    if IsBusy() then return end
+    if not RSGCore.Functions.HasItem('resource_wood', Config.RepairWoodAmount) then
+        return Notify(locale('rocker_not_enough_wood', Config.RepairWoodAmount), nil, 'error', 'circle-xmark')
+    end
 
-    RSGCore.Functions.TriggerCallback('rsg-goldclaim:rocker:server:getrockerdata', function(result)
-        if not result then return end
-
-        if result.quality >= 100 then
-            Notify(locale('rocker_repair_not_needed'), nil, 'warning', 5000, 'INFO')
-            return
-        end
-
-        local hasWood = RSGCore.Functions.HasItem('wood', Config.RepairWoodAmount)
-        if not hasWood then
-            Notify(locale('rocker_not_enough_wood'), nil, 'cross', 5000, 'ERROR')
-            return
-        end
-
-        isBusy = true
-        LocalPlayer.state:set("inv_busy", true, true)
-
-        local ped = PlayerPedId()
-        FreezeEntityPosition(ped, true)
-        TaskStartScenarioInPlace(ped, Config.Anims.crouch_inspect, 0, true)
-
-        if lib.progressBar({
-            duration = Config.RepairTime,
-            position = 'bottom',
-            useWhileDead = false,
-            canCancel = false,
-            disable = { move = true, car = true, combat = true },
-            label = locale('rocker_repairing'),
-        }) then
-            ClearPedTasks(ped)
-            FreezeEntityPosition(ped, false)
-            TriggerServerEvent('rsg-goldclaim:rocker:server:repairrocker', data.rockerid)
-        else
-            ClearPedTasks(ped)
-            FreezeEntityPosition(ped, false)
-        end
-
-        LocalPlayer.state:set("inv_busy", false, true)
-        isBusy = false
-
-    end, data.rockerid)
+    if DoTimedAction({
+        duration = Config.RepairTime,
+        scenario = Config.Anims.crouch_inspect,
+    }) then
+        TriggerServerEvent('rsg-goldclaim:rocker:server:repairrocker', data.rockerid)
+    end
 end)
 
 ---------------------------------------------
--- rename claim (custom modal)
+-- rename claim
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:client:renameclaim', function(data)
     OpenInputDialog(locale('rocker_rename_title'), {
         {
             label = locale('rocker_rename_label'),
-            description = locale('rocker_rename_desc'),
+            description = locale('rocker_rename_desc', Config.MaxClaimNameLength),
             type = 'input',
             icon = 'fa-solid fa-pen',
             required = true,
+            maxLength = Config.MaxClaimNameLength,
         },
     }, function(input)
-        if not input or not input[1] then return end
-
-        TriggerServerEvent('rsg-goldclaim:rocker:server:renameclaim', data.rockerid, input[1])
-        Notify(locale('rocker_claim_renamed'), input[1], 'tick', 5000, 'SUCCESS')
+        if input and input[1] and input[1] ~= '' then
+            TriggerServerEvent('rsg-goldclaim:rocker:server:renameclaim', data.rockerid, input[1])
+        end
     end)
 end)
 
@@ -779,414 +513,131 @@ end)
 -- pack up rocker
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:client:packuprocker', function(data)
-    if isBusy then return end
+    if IsBusy() then return end
 
-    RSGCore.Functions.TriggerCallback('rsg-goldclaim:rocker:server:getrockerdata', function(result)
-        if not result then return end
-
-        if result.quality ~= 100 then
-            Notify(locale('rocker_needs_repair'), nil, 'cross', 5000, 'ERROR')
-            return
-        end
-
-        isBusy = true
-        LocalPlayer.state:set("inv_busy", true, true)
-
-        local ped = PlayerPedId()
-        FreezeEntityPosition(ped, true)
-        TaskStartScenarioInPlace(ped, Config.Anims.crouch_inspect, 0, true)
-
-        if lib.progressBar({
-            duration = Config.CollectGoldTime,
-            position = 'bottom',
-            useWhileDead = false,
-            canCancel = false,
-            disable = { move = true, car = true, combat = true },
-            label = locale('rocker_packing_up'),
-        }) then
-            ClearPedTasks(ped)
-            FreezeEntityPosition(ped, false)
-
-            -- smoke effect
-            for _, sp in ipairs(SpawnedProps) do
-                if sp.id == data.rockerid then
-                    local propcoords = GetEntityCoords(sp.obj)
-                    UseParticleFxAsset(fx_group)
-                    StartParticleFxNonLoopedAtCoord(fx_name, propcoords.x, propcoords.y, propcoords.z, 0.0, 0.0, 0.0, fx_scale, false, false, false, true)
-                    break
-                end
-            end
-
-            TriggerServerEvent('rsg-goldclaim:rocker:server:destroyProp', data.rockerid)
-        else
-            ClearPedTasks(ped)
-            FreezeEntityPosition(ped, false)
-        end
-
-        LocalPlayer.state:set("inv_busy", false, true)
-        isBusy = false
-
-    end, data.rockerid)
+    if DoTimedAction({
+        duration = Config.PackUpTime,
+        scenario = Config.Anims.crouch_inspect,
+    }) then
+        PlaySmoke(data.rockerid)
+        TriggerServerEvent('rsg-goldclaim:rocker:server:destroyProp', data.rockerid)
+    end
 end)
 
 ---------------------------------------------
 -- LEO destroy illegal claim
 ---------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:destroyillegal', function(rockerid, entity)
-    if isBusy then return end
+RegisterNetEvent('rsg-goldclaim:rocker:client:destroyillegal', function(propid)
+    if type(propid) == 'table' then propid = propid.rockerid end -- from context menu
+    if IsBusy() then return end
 
-    -- support both arg styles (from target vs menu)
-    if type(rockerid) == 'table' then
-        entity = nil
-        rockerid = rockerid.rockerid
-    end
-
-    isBusy = true
-    LocalPlayer.state:set("inv_busy", true, true)
-
-    local ped = PlayerPedId()
-    FreezeEntityPosition(ped, true)
-    TaskStartScenarioInPlace(ped, Config.Anims.crouch_inspect, 0, true)
-
-    if lib.progressBar({
-        duration = 10000,
-        position = 'bottom',
-        useWhileDead = false,
-        canCancel = false,
-        disable = { move = true, car = true, combat = true },
-        label = locale('rocker_destroying_claim'),
+    if DoTimedAction({
+        duration = Config.DestroyTime,
+        scenario = Config.Anims.crouch_inspect,
     }) then
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-
-        -- smoke effect
-        for _, sp in ipairs(SpawnedProps) do
-            if sp.id == rockerid then
-                local propcoords = GetEntityCoords(sp.obj)
-                UseParticleFxAsset(fx_group)
-                StartParticleFxNonLoopedAtCoord(fx_name, propcoords.x, propcoords.y, propcoords.z, 0.0, 0.0, 0.0, fx_scale, false, false, false, true)
-                break
-            end
-        end
-
-        TriggerServerEvent('rsg-goldclaim:rocker:server:leodestroy', rockerid)
-        Notify(locale('rocker_claim_destroyed'), locale('rocker_evidence_collected'), 'tick', 5000, 'SUCCESS')
-    else
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
+        PlaySmoke(propid)
+        TriggerServerEvent('rsg-goldclaim:rocker:server:leodestroy', propid)
     end
-
-    LocalPlayer.state:set("inv_busy", false, true)
-    isBusy = false
 end)
 
 ---------------------------------------------
--- place gold rocker
+-- place gold rocker (called by placeprop.lua)
 ---------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:placeNewProp')
-AddEventHandler('rsg-goldclaim:rocker:client:placeNewProp', function(proptype, pHash, item, pos, heading)
-    RSGCore.Functions.TriggerCallback('rsg-goldclaim:rocker:server:countprop', function(result)
-        local inwater = IsEntityInWater(cache.ped)
+AddEventHandler('rsg-goldclaim:rocker:client:placeNewProp', function(pos, heading)
+    if IsBusy() then return end
 
-        if inwater then
-            Notify(locale('rocker_cant_place_here'), nil, 'cross', 5000, 'ERROR')
-            return
-        end
+    if IsEntityInWater(cache.ped) then
+        return Notify(locale('rocker_cant_place_here'), nil, 'error', 'circle-xmark')
+    end
 
-        if proptype == 'goldrocker' and result >= Config.MaxGoldRockers then
-            Notify(locale('rocker_max_equipment'), nil, 'cross', 5000, 'ERROR')
-            return
-        end
+    local count = lib.callback.await('rsg-goldclaim:server:countprops', false)
+    if count >= Config.MaxGoldRockers then
+        return Notify(locale('rocker_max_equipment'), nil, 'error', 'circle-xmark')
+    end
 
-        if not isBusy then
-            isBusy = true
-            LocalPlayer.state:set("inv_busy", true, true)
-
-            local anim1 = `WORLD_HUMAN_CROUCH_INSPECT`
-            FreezeEntityPosition(cache.ped, true)
-            TaskStartScenarioInPlace(cache.ped, anim1, 0, true)
-            Wait(10000)
-            ClearPedTasks(cache.ped)
-            FreezeEntityPosition(cache.ped, false)
-
-            TriggerServerEvent('rsg-goldclaim:rocker:server:newProp', proptype, pos, heading, pHash)
-
-            LocalPlayer.state:set("inv_busy", false, true)
-            isBusy = false
-        else
-            Notify(locale('rocker_processing_busy'), nil, 'cross', 5000, 'ERROR')
-        end
-
-    end, proptype)
+    if DoTimedAction({
+        duration = Config.PlaceTime,
+        scenario = Config.Anims.crouch_inspect,
+    }) then
+        TriggerServerEvent('rsg-goldclaim:rocker:server:newProp', pos, heading)
+    end
 end)
 
 ---------------------------------------------
--- update props from server
+-- shovel (dig paydirt in water)
 ---------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:updatePropData')
-AddEventHandler('rsg-goldclaim:rocker:client:updatePropData', function(data)
-    Config.PlayerProps = data
-    -- rebuild zones and blips for all licensed claims
-    SyncClaimZones()
-end)
-
----------------------------------------------
--- sync claim zones & blips from prop data
--- runs on every prop data update so zones
--- persist across restarts for all players
----------------------------------------------
-function SyncClaimZones()
-    -- track which zones should exist
-    local activeIds = {}
-
-    for i = 1, #Config.PlayerProps do
-        local p = Config.PlayerProps[i]
-        local zoneId = 'goldclaim_' .. p.id
-        local isLicensed = (p.licensed == 1 or p.licensed == true)
-
-        if Config.Debug then print('[rsg-goldclaim] SyncZone check: id=' .. tostring(p.id) .. ' licensed=' .. tostring(p.licensed) .. '(' .. type(p.licensed) .. ') claimname=' .. tostring(p.claimname)) end
-
-        if isLicensed and p.claimname and p.claimname ~= '' then
-            activeIds[zoneId] = true
-
-            -- only create if not already running
-            if not ActiveZones[zoneId] then
-                if Config.Debug then print('[rsg-goldclaim] Creating zone + blip for claim: ' .. p.claimname) end
-                SetupClaimZone(p)
-            end
-        end
-    end
-
-    -- remove zones/blips for claims that no longer exist
-    for zoneId, zoneData in pairs(ActiveZones) do
-        if not activeIds[zoneId] then
-            zoneData.active = false
-            ActiveZones[zoneId] = nil
-
-            -- extract propid from zoneId
-            local propId = tonumber(zoneId:gsub('goldclaim_', ''))
-            if propId and ActiveBlips[propId] then
-                RemoveBlip(ActiveBlips[propId])
-                ActiveBlips[propId] = nil
-            end
-        end
-    end
+local function SpawnDigDirtPile(ped)
+    local cfg = Config.DigDirtPile
+    if not cfg or not cfg.enabled or not LoadModel(cfg.model) then return end
+    local pos, fwd = GetEntityCoords(ped), GetEntityForwardVector(ped)
+    local pile = CreateObject(cfg.model, pos.x + fwd.x * cfg.offset, pos.y + fwd.y * cfg.offset, pos.z - 1.0, false, false, false)
+    SetModelAsNoLongerNeeded(cfg.model)
+    SetTimeout(cfg.lifetime, function()
+        if DoesEntityExist(pile) then DeleteObject(pile) end
+    end)
 end
 
----------------------------------------------
--- remove prop object
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:removePropObject')
-AddEventHandler('rsg-goldclaim:rocker:client:removePropObject', function(prop)
-    -- remove target, blip, zone
-    for i = 1, #SpawnedProps do
-        local o = SpawnedProps[i]
-        if o.id == prop then
-            if DoesEntityExist(o.obj) then
-                exports.ox_target:removeLocalEntity(o.obj)
-                SetEntityAsMissionEntity(o.obj, false)
-                FreezeEntityPosition(o.obj, false)
-                DeleteObject(o.obj)
-            end
-            table.remove(SpawnedProps, i)
-            break
-        end
-    end
-
-    -- stop zone thread
-    local zoneId = 'goldclaim_' .. prop
-    if ActiveZones[zoneId] then
-        ActiveZones[zoneId].active = false
-        ActiveZones[zoneId] = nil
-    end
-
-    -- remove blip
-    if ActiveBlips[prop] then
-        RemoveBlip(ActiveBlips[prop])
-        ActiveBlips[prop] = nil
-    end
-end)
-
----------------------------------------------
--- refresh zone/blip after rename
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:refreshclaim', function(rockerid, newname)
-    -- update local SpawnedProps data
-    for _, sp in ipairs(SpawnedProps) do
-        if sp.id == rockerid then
-            sp.claimname = newname
-            break
-        end
-    end
-    -- update PlayerProps
-    for i = 1, #Config.PlayerProps do
-        if Config.PlayerProps[i].id == rockerid then
-            Config.PlayerProps[i].claimname = newname
-            break
-        end
-    end
-    -- kill old zone/blip and recreate with new name
-    local zoneId = 'goldclaim_' .. rockerid
-    if ActiveZones[zoneId] then
-        ActiveZones[zoneId].active = false
-        ActiveZones[zoneId] = nil
-    end
-    if ActiveBlips[rockerid] then
-        RemoveBlip(ActiveBlips[rockerid])
-        ActiveBlips[rockerid] = nil
-    end
-    local propData = GetPropDataById(rockerid)
-    if propData and propData.licensed == 1 then
-        propData.claimname = newname
-        SetupClaimZone(propData)
-    end
-end)
-
----------------------------------------------
--- processing complete notification
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:client:processingcomplete', function(propid)
-    Notify(locale('rocker_processing_complete_title'), locale('rocker_processing_complete_desc'), 'leaderboard_gold', 7000, 'INFO')
-end)
-
----------------------------------------------
--- use shovel (dig paydirt in water)
----------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:client:useshovel', function()
-    if isBusy then
-        Notify(locale('rocker_processing_busy'), nil, 'cross', 3000, 'ERROR')
-        return
+    if IsBusy() then return end
+    if not IsEntityInWater(cache.ped) then
+        return Notify(locale('rocker_not_in_water'), nil, 'error', 'circle-xmark')
     end
+    local dig = Config.Anims.dig
+    if not LoadModel(Config.ShovelProp.model) or not LoadAnimDict(dig.dict) then return end
 
-    local inwater = IsEntityInWater(cache.ped)
-    if not inwater then
-        Notify(locale('rocker_not_in_water'), nil, 'cross', 5000, 'ERROR')
-        return
-    end
-
-    isBusy = true
-    LocalPlayer.state:set("inv_busy", true, true)
-
-    local ped = PlayerPedId()
+    local ped = cache.ped
     SetCurrentPedWeapon(ped, `WEAPON_UNARMED`, true)
-    FreezeEntityPosition(ped, true)
-
-    -- attach shovel prop
-    local shovelModel = GetHashKey(Config.ShovelProp.model)
-    RequestModel(shovelModel)
-    while not HasModelLoaded(shovelModel) do Wait(100) end
 
     local coords = GetEntityCoords(ped)
-    local shovelObject = CreateObject(shovelModel, coords.x, coords.y, coords.z, true, true, true)
-    local boneIndex = GetEntityBoneIndexByName(ped, Config.ShovelProp.bone)
-    local offset = Config.ShovelProp.offset
-    AttachEntityToEntity(shovelObject, ped, boneIndex, offset[1], offset[2], offset[3], offset[4], offset[5], offset[6], false, false, false, false, 2, true)
+    local shovel = CreateObject(Config.ShovelProp.model, coords.x, coords.y, coords.z, true, true, true)
+    local o = Config.ShovelProp.offset
+    AttachEntityToEntity(shovel, ped, GetEntityBoneIndexByName(ped, Config.ShovelProp.bone),
+        o[1], o[2], o[3], o[4], o[5], o[6], true, true, false, true, 1, true)
+    SetModelAsNoLongerNeeded(Config.ShovelProp.model)
+    TaskPlayAnim(ped, dig.dict, dig.name, 3.0, 3.0, -1, 1, 0, false, false, false)
 
-    -- dig animation
-    local animData = Config.Anims.dig
-    LoadAnimDict(animData.dict)
-    TaskPlayAnim(ped, animData.dict, animData.name, 1.0, 1.0, -1, 1, 0, false, false, false)
-
-    if lib.progressBar({
+    local completed = DoTimedAction({
         duration = Config.ShovelDigTime,
-        position = 'bottom',
-        useWhileDead = false,
-        canCancel = true,
-        disable = { move = true, car = true, combat = true },
-        label = locale('rocker_digging_paydirt'),
-    }) then
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-        if DoesEntityExist(shovelObject) then
-            DeleteObject(shovelObject)
-        end
-        SetModelAsNoLongerNeeded(shovelModel)
-        TriggerServerEvent('rsg-goldclaim:rocker:server:digpaydirt')
-    else
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
-        if DoesEntityExist(shovelObject) then
-            DeleteObject(shovelObject)
-        end
-        SetModelAsNoLongerNeeded(shovelModel)
-    end
+        onCleanup = function()
+            if DoesEntityExist(shovel) then
+                DetachEntity(shovel, true, false)
+                DeleteObject(shovel)
+            end
+            RemoveAnimDict(dig.dict)
+        end,
+    })
 
-    LocalPlayer.state:set("inv_busy", false, true)
-    isBusy = false
+    if completed then
+        SpawnDigDirtPile(ped)
+        TriggerServerEvent('rsg-goldclaim:rocker:server:digpaydirt')
+    end
 end)
 
 ---------------------------------------------
--- use bucket (fill with water)
+-- bucket (fill with water)
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:client:usebucket', function()
-    if isBusy then
-        Notify(locale('rocker_processing_busy'), nil, 'cross', 3000, 'ERROR')
-        return
+    if IsBusy() then return end
+    if not IsEntityInWater(cache.ped) then
+        return Notify(locale('rocker_not_in_water'), nil, 'error', 'circle-xmark')
     end
 
-    local inwater = IsEntityInWater(cache.ped)
-    if not inwater then
-        Notify(locale('rocker_not_in_water'), nil, 'cross', 5000, 'ERROR')
-        return
-    end
-
-    isBusy = true
-    LocalPlayer.state:set("inv_busy", true, true)
-
-    local ped = PlayerPedId()
-    FreezeEntityPosition(ped, true)
-
-    -- use scenario (reliable, no anim dict needed)
-    TaskStartScenarioInPlace(ped, `WORLD_HUMAN_CROUCH_INSPECT`, 0, true)
-
-    if lib.progressBar({
+    if DoTimedAction({
         duration = Config.BucketFillTime,
-        position = 'bottom',
-        useWhileDead = false,
-        canCancel = true,
-        disable = { move = true, car = true, combat = true },
-        label = locale('rocker_filling_bucket'),
+        scenario = Config.Anims.crouch_inspect,
     }) then
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
         TriggerServerEvent('rsg-goldclaim:rocker:server:fillbucket')
-    else
-        ClearPedTasks(ped)
-        FreezeEntityPosition(ped, false)
     end
-
-    LocalPlayer.state:set("inv_busy", false, true)
-    isBusy = false
 end)
 
 ---------------------------------------------
--- clean up on resource stop
+-- cleanup
 ---------------------------------------------
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= GetCurrentResourceName() then return end
-
-    for i = 1, #SpawnedProps do
-        local props = SpawnedProps[i].obj
-        if DoesEntityExist(props) then
-            exports.ox_target:removeLocalEntity(props)
-            SetEntityAsMissionEntity(props, false)
-            FreezeEntityPosition(props, false)
-            DeleteObject(props)
-        end
-    end
-
-    for _, obj in pairs(SpawnedOutputProps) do
-        if DoesEntityExist(obj) then
-            exports.ox_target:removeLocalEntity(obj)
-            DeleteObject(obj)
-        end
-    end
-
-    for _, zone in pairs(ActiveZones) do
-        zone.active = false
-    end
-
-    for _, blip in pairs(ActiveBlips) do
-        RemoveBlip(blip)
-    end
+    for propid in pairs(SpawnedProps) do DespawnRocker(propid) end
+    for propid in pairs(VegModifiers) do RemoveVegModifier(propid) end
+    ClearOutputProps()
+    for propid in pairs(ClaimZones) do RemoveClaimZone(propid) end
+    LocalPlayer.state:set('inv_busy', false, true)
 end)

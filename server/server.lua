@@ -1,360 +1,360 @@
 lib.locale()
 
 local RSGCore = exports['rsg-core']:GetCoreObject()
-local PropsLoaded = false
-local ProcessingRockers = {}
-local PendingRockerOutputs = {} -- [propid] = 'gold' | 'paydirt' (set only by the server when a processing cycle completes)
-local GatherCooldowns = {} -- [citizenid] = os.time() when the next dig/fill is allowed
+local Inventory = exports['rsg-inventory']
+
+local PropsLoaded      = false
+local ProcessingRockers = {} -- [propid] = citizenid of the player running it
+local PendingOutputs   = {} -- [propid] = { cid = citizenid, gold = n, paydirt = n } (server-authoritative)
+local Cooldowns        = {} -- [src] = { [key] = GetGameTimer() expiry }
+
 
 ---------------------------------------------
--- helper: send an ox_lib notification to a client (target = -1 to broadcast)
+-- helpers
 ---------------------------------------------
-local NotifyIcons = {
-    warning          = 'triangle-exclamation',
-    cross            = 'circle-xmark',
-    tick             = 'circle-check',
-    leaderboard_gold = 'coins',
-    awards_set_c_001 = 'box-open',
-}
-
-local NotifyTypes = {
-    ERROR    = 'error',
-    SUCCESS  = 'success',
-    INFO     = 'info',
-    TIP_GOLD = 'success',
-}
-
-function Notify(target, title, description, icon, duration, template)
-    TriggerClientEvent('ox_lib:notify', target, {
-        title = title,
+local function Notify(src, title, description, nType, icon, duration)
+    TriggerClientEvent('ox_lib:notify', src, {
+        title       = title,
         description = description,
-        type = NotifyTypes[template] or 'info',
-        icon = NotifyIcons[icon] or icon,
-        duration = duration or 5000,
-        position = 'center-right',
+        type        = nType or 'inform',
+        icon        = icon,
+        duration    = duration or Config.NotifyDuration,
+        position    = Config.NotifyPosition,
     })
 end
 
----------------------------------------------
--- helper: simple per-citizenid cooldown gate
--- returns true if still on cooldown (call should be rejected)
----------------------------------------------
-local function OnGatherCooldown(citizenid, seconds)
-    local expires = GatherCooldowns[citizenid]
-    if expires and expires > os.time() then
-        return true
-    end
-    GatherCooldowns[citizenid] = os.time() + (seconds or 1)
+local function Debug(...)
+    if Config.Debug then print('[rsg-goldclaim]', ...) end
+end
+
+--- returns true if the action is still on cooldown (and should be rejected)
+local function OnCooldown(src, key, ms)
+    Cooldowns[src] = Cooldowns[src] or {}
+    local now = GetGameTimer()
+    if (Cooldowns[src][key] or 0) > now then return true end
+    Cooldowns[src][key] = now + ms
     return false
 end
 
----------------------------------------------
--- internal: persist a prop to the database
--- (plain function, NOT a net event - never trust this with client-supplied data)
----------------------------------------------
-function RockerSaveProp(data, propId, citizenid, owner, proptype, licensed, claimname)
-    local datas = json.encode(data)
-    MySQL.Async.execute('INSERT INTO player_goldrockers (properties, propid, citizenid, owner, proptype, licensed, claimname) VALUES (@properties, @propid, @citizenid, @owner, @proptype, @licensed, @claimname)', {
-        ['@properties'] = datas,
-        ['@propid']     = propId,
-        ['@citizenid']  = citizenid,
-        ['@owner']      = owner,
-        ['@proptype']   = proptype,
-        ['@licensed']   = licensed or 0,
-        ['@claimname']  = claimname,
-    })
-end
-
----------------------------------------------
--- internal: broadcast current prop data to all clients
----------------------------------------------
-function RockerUpdateProps()
-    TriggerClientEvent('rsg-goldclaim:rocker:client:updatePropData', -1, Config.PlayerProps)
-end
-
----------------------------------------------
--- internal: load props from the database into memory (idempotent)
----------------------------------------------
-function RockerLoadProps()
-    Config.PlayerProps = {}
-
-    local result = MySQL.query.await('SELECT * FROM player_goldrockers')
-    if not result or not result[1] then return end
-
-    for i = 1, #result do
-        local propData = json.decode(result[i].properties)
-        -- inject license/claim data into prop data for client use
-        propData.licensed  = result[i].licensed or 0
-        propData.claimname = result[i].claimname
-        if Config.Debug then print('[rsg-goldclaim] loading ' .. propData.proptype .. ' prop with ID: ' .. propData.id) end
-        table.insert(Config.PlayerProps, propData)
+local function AddItem(src, item, amount, reason)
+    if not Inventory:CanAddItem(src, item, amount) then
+        Notify(src, locale('rocker_inventory_full'), nil, 'error', 'circle-xmark')
+        return false
     end
+    if Inventory:AddItem(src, item, amount, nil, nil, reason) then
+        TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[item], 'add', amount)
+        return true
+    end
+    return false
 end
 
----------------------------------------------
--- helper: find a loaded prop's data by id (from Config.PlayerProps)
----------------------------------------------
+local function RemoveItem(src, item, amount, reason)
+    if Inventory:RemoveItem(src, item, amount, nil, reason) then
+        TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[item], 'remove', amount)
+        return true
+    end
+    return false
+end
+
+local function GetItemCount(Player, item)
+    local count = 0
+    for _, v in pairs(Player.PlayerData.items or {}) do
+        if v and v.name == item then count = count + (v.amount or 0) end
+    end
+    return count
+end
+
 local function GetRockerPropById(propid)
-    for _, v in pairs(Config.PlayerProps) do
-        if v.id == propid then
-            return v
+    for i = 1, #Config.PlayerProps do
+        if Config.PlayerProps[i].id == propid then
+            return Config.PlayerProps[i], i
         end
     end
-    return nil
 end
 
----------------------------------------------
--- helper: is this player currently near the given prop's stored location?
--- (defense in depth: several events below are only ever meant to be fired
--- while physically at the rocker, but nothing stops a modified client from
--- firing them directly, so re-check distance server-side)
----------------------------------------------
-local function IsPlayerNearProp(src, propData, radius)
-    if not propData then return false end
+local function GetPlayerCoords(src)
     local ped = GetPlayerPed(src)
-    if not ped or ped == 0 then return false end
-    local pos = GetEntityCoords(ped)
-    local dist = #(pos - vector3(propData.x, propData.y, propData.z))
-    return dist <= (radius or 5.0)
+    if not ped or ped == 0 then return nil end
+    return GetEntityCoords(ped)
+end
+
+local function IsNearCoords(src, coords, radius)
+    local pos = GetPlayerCoords(src)
+    return pos ~= nil and #(pos - coords) <= radius
+end
+
+local function IsNearProp(src, propData, radius)
+    if not propData then return false end
+    return IsNearCoords(src, vector3(propData.x, propData.y, propData.z), radius or Config.InteractDistance)
+end
+
+--- validates player + rocker + proximity; returns Player, propData
+local function ValidateRockerAction(src, propid, radius)
+    local Player = RSGCore.Functions.GetPlayer(src)
+    if not Player then return end
+    propid = tonumber(propid)
+    if not propid then return end
+    local propData = GetRockerPropById(propid)
+    if not propData then return end
+    if not IsNearProp(src, propData, radius) then
+        Notify(src, locale('rocker_too_far'), nil, 'error', 'circle-xmark')
+        local pos = GetPlayerCoords(src)
+        local dist = pos and #(pos - vector3(propData.x, propData.y, propData.z)) or -1
+        if dist > (radius or Config.InteractDistance) * 5 then -- way beyond any desync = likely exploit
+            Webhook.Suspicious(src, locale('wh_reason_far_event'), {
+                { locale('wh_event'), locale('wh_rocker_action') },
+                { locale('wh_rocker_id'), propid }, { locale('wh_distance'), ('%.1fm'):format(dist) },
+            })
+        end
+        return
+    end
+    return Player, propData, propid
+end
+
+-- oxmysql returns tinyint(1) as a boolean, normalise to 0/1
+local function ToFlag(v)
+    return (v == true or v == 1) and 1 or 0
+end
+
+local function RockerUpdateProps(target)
+    TriggerClientEvent('rsg-goldclaim:rocker:client:updatePropData', target or -1, Config.PlayerProps)
+end
+
+--- removes a rocker from memory, the world and the database
+local function RemoveRocker(propid)
+    local _, index = GetRockerPropById(propid)
+    if index then table.remove(Config.PlayerProps, index) end
+    ProcessingRockers[propid] = nil
+    PendingOutputs[propid] = nil
+    TriggerClientEvent('rsg-goldclaim:rocker:client:removePropObject', -1, propid)
+    MySQL.update('DELETE FROM player_goldrockers WHERE propid = ?', { propid })
+end
+
+local function LoadProps()
+    Config.PlayerProps = {}
+    local result = MySQL.query.await('SELECT properties, licensed, claimname FROM player_goldrockers')
+    for i = 1, #(result or {}) do
+        local propData = json.decode(result[i].properties)
+        if propData then
+            propData.licensed  = ToFlag(result[i].licensed)
+            propData.claimname = result[i].claimname
+            propData.hash      = Config.GoldRocker
+            Config.PlayerProps[#Config.PlayerProps + 1] = propData
+            Debug('loaded rocker', propData.id)
+        end
+    end
 end
 
 ---------------------------------------------
--- use goldrocker item (triggers placement)
+-- startup
 ---------------------------------------------
-RSGCore.Functions.CreateUseableItem("goldrocker", function(source)
+CreateThread(function()
+    LoadProps()
+    PropsLoaded = true
+    RockerUpdateProps()
+end)
+
+lib.callback.register('rsg-goldclaim:server:getprops', function()
+    while not PropsLoaded do Wait(100) end
+    return Config.PlayerProps
+end)
+
+--- unclaimed outputs for this character (so they survive a relog)
+lib.callback.register('rsg-goldclaim:server:getpending', function(source)
+    local Player = RSGCore.Functions.GetPlayer(source)
+    if not Player then return {} end
+    local cid, list = Player.PlayerData.citizenid, {}
+    for propid, p in pairs(PendingOutputs) do
+        if p.cid == cid then list[#list + 1] = { propid = propid, gold = p.gold, paydirt = p.paydirt } end
+    end
+    return list
+end)
+
+AddEventHandler('playerDropped', function()
     local src = source
-    TriggerClientEvent('rsg-goldclaim:rocker:client:createprop', src, 'goldrocker', Config.GoldRocker, 'goldrocker')
+    Cooldowns[src] = nil
 end)
 
 ---------------------------------------------
--- use shovel (dig paydirt from water)
+-- useable items
 ---------------------------------------------
-RSGCore.Functions.CreateUseableItem("shovel", function(source)
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    TriggerClientEvent('rsg-goldclaim:rocker:client:useshovel', src)
+RSGCore.Functions.CreateUseableItem('tool_goldrocker', function(source)
+    TriggerClientEvent('rsg-goldclaim:rocker:client:createprop', source)
+end)
+
+RSGCore.Functions.CreateUseableItem('tool_rocker_shovel', function(source)
+    TriggerClientEvent('rsg-goldclaim:rocker:client:useshovel', source)
+end)
+
+RSGCore.Functions.CreateUseableItem('tool_rocker_bucket_empty', function(source)
+    TriggerClientEvent('rsg-goldclaim:rocker:client:usebucket', source)
 end)
 
 ---------------------------------------------
--- use bucket (fill with water)
----------------------------------------------
-RSGCore.Functions.CreateUseableItem("bucket", function(source)
-    local src = source
-    TriggerClientEvent('rsg-goldclaim:rocker:client:usebucket', src)
-end)
-
----------------------------------------------
--- client handler: use shovel in water
+-- gathering: dig paydirt / fill bucket
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:digpaydirt', function()
     local src = source
     local Player = RSGCore.Functions.GetPlayer(src)
     if not Player then return end
+    if OnCooldown(src, 'gather', Config.ShovelDigTime - 500) then return end
+    if GetItemCount(Player, 'tool_rocker_shovel') < 1 then return end
 
-    local citizenid = Player.PlayerData.citizenid
-    if OnGatherCooldown(citizenid, math.max(1, math.floor(Config.ShovelDigTime / 1000))) then return end
-
-    local hasShovel = Player.Functions.GetItemByName('shovel')
-    if not hasShovel then return end
-
-    Player.Functions.AddItem('paydirt', 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['paydirt'], "add")
+    AddItem(src, 'resource_paydirt', 1, 'rsg-goldclaim:dig')
 end)
 
----------------------------------------------
--- client handler: fill bucket in water
----------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:fillbucket', function()
     local src = source
     local Player = RSGCore.Functions.GetPlayer(src)
     if not Player then return end
+    if OnCooldown(src, 'gather', Config.BucketFillTime - 500) then return end
+    if GetItemCount(Player, 'tool_rocker_bucket_empty') < 1 then return end
 
-    local citizenid = Player.PlayerData.citizenid
-    if OnGatherCooldown(citizenid, math.max(1, math.floor(Config.BucketFillTime / 1000))) then return end
-
-    local hasBucket = Player.Functions.GetItemByName('bucket')
-    if not hasBucket or hasBucket.amount < 1 then return end
-
-    -- remove bucket, give fullbucket
-    Player.Functions.RemoveItem('bucket', 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['bucket'], "remove")
-    Player.Functions.AddItem('fullbucket', 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['fullbucket'], "add")
-end)
-
----------------------------------------------
--- count props callback
----------------------------------------------
-RSGCore.Functions.CreateCallback('rsg-goldclaim:rocker:server:countprop', function(source, cb, proptype)
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return cb(0) end
-    local citizenid = Player.PlayerData.citizenid
-    local result = MySQL.prepare.await("SELECT COUNT(*) as count FROM player_goldrockers WHERE citizenid = ? AND proptype = ?", { citizenid, proptype })
-    if result then
-        cb(result)
-    else
-        cb(0)
+    if RemoveItem(src, 'tool_rocker_bucket_empty', 1, 'rsg-goldclaim:fillbucket') then
+        if not AddItem(src, 'tool_rocker_bucket_full', 1, 'rsg-goldclaim:fillbucket') then
+            AddItem(src, 'tool_rocker_bucket_empty', 1, 'rsg-goldclaim:refund')
+        end
     end
 end)
 
 ---------------------------------------------
--- get rocker data callback
+-- callbacks
 ---------------------------------------------
-RSGCore.Functions.CreateCallback('rsg-goldclaim:rocker:server:getrockerdata', function(source, cb, propid)
-    MySQL.query('SELECT * FROM player_goldrockers WHERE propid = ?', {propid}, function(result)
-        if result and result[1] then
-            cb(result[1])
-        else
-            cb(nil)
-        end
-    end)
+lib.callback.register('rsg-goldclaim:server:countprops', function(source)
+    local Player = RSGCore.Functions.GetPlayer(source)
+    if not Player then return 0 end
+    local cid, count = Player.PlayerData.citizenid, 0
+    for _, v in pairs(Config.PlayerProps) do
+        if v.builder == cid then count = count + 1 end
+    end
+    return count
+end)
+
+lib.callback.register('rsg-goldclaim:server:getrockerdata', function(source, propid)
+    propid = tonumber(propid)
+    local propData = propid and GetRockerPropById(propid)
+    if not propData or not IsNearProp(source, propData, Config.ClaimZoneRadius) then return nil end
+    local result = MySQL.single.await('SELECT propid, citizenid, owner, licensed, claimname, paydirt, water, quality FROM player_goldrockers WHERE propid = ?', { propid })
+    if result then
+        result.processing = ProcessingRockers[propid] ~= nil
+        result.licensed = ToFlag(result.licensed)
+    end
+    return result
 end)
 
 ---------------------------------------------
--- new prop (with license check)
+-- place a new rocker
 ---------------------------------------------
-RegisterServerEvent('rsg-goldclaim:rocker:server:newProp')
-AddEventHandler('rsg-goldclaim:rocker:server:newProp', function(proptype, location, heading, hash)
+RegisterNetEvent('rsg-goldclaim:rocker:server:newProp', function(location, heading)
     local src = source
     local Player = RSGCore.Functions.GetPlayer(src)
     if not Player then return end
+    if OnCooldown(src, 'place', 3000) then return end
 
-    if proptype ~= 'goldrocker' then return end
-    if not location or type(location.x) ~= 'number' or type(location.y) ~= 'number' or type(location.z) ~= 'number' then return end
-    heading = tonumber(heading) or 0.0
+    if type(location) ~= 'vector3' and (type(location) ~= 'table' or type(location.x) ~= 'number') then return end
+    location = vector3(location.x + 0.0, location.y + 0.0, location.z + 0.0)
+    heading = (tonumber(heading) or 0.0) % 360.0
 
-    local propId = math.random(111111, 999999)
-    while GetRockerPropById(propId) do
-        propId = math.random(111111, 999999)
-    end
-    local citizenid = Player.PlayerData.citizenid
-    local firstname = Player.PlayerData.charinfo.firstname
-    local lastname = Player.PlayerData.charinfo.lastname
-    local owner = firstname .. ' ' .. lastname
-
-    -- check for license
-    local hasLicense = Player.Functions.GetItemByName('goldclaimlicense')
-    local licensed = 0
-    local claimname = nil
-
-    local PropCount = 0
-    for _, v in pairs(Config.PlayerProps) do
-        if v.builder == citizenid then
-            PropCount = PropCount + 1
-        end
-    end
-
-    if PropCount >= Config.MaxGoldRockers then
-        Notify(src, locale('rocker_server_max_reached'), nil, 'cross', 5000, 'ERROR')
+    if not IsNearCoords(src, location, Config.PlaceMaxDistance) then
+        Notify(src, locale('rocker_too_far'), nil, 'error', 'circle-xmark')
+        Webhook.Suspicious(src, locale('wh_reason_far_place'), {
+            { locale('wh_requested_coords'), ('%.2f, %.2f, %.2f'):format(location.x, location.y, location.z) },
+        })
         return
     end
 
-    -- verify the player actually has the rocker item before creating anything
-    -- (RemoveItem's return value isn't a reliable success indicator in this framework)
-    local hasProp = Player.Functions.GetItemByName(proptype)
-    if not hasProp or hasProp.amount < 1 then return end
-
-    Player.Functions.RemoveItem(proptype, 1)
-
-    if hasLicense and hasLicense.amount > 0 then
-        licensed = 1
-        claimname = owner .. "'s Gold Claim"
-        -- consume the license
-        Player.Functions.RemoveItem('goldclaimlicense', 1)
-        TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['goldclaimlicense'], "remove")
+    local citizenid = Player.PlayerData.citizenid
+    local count = 0
+    for _, v in pairs(Config.PlayerProps) do
+        if v.builder == citizenid then count = count + 1 end
+        if #(location - vector3(v.x, v.y, v.z)) < Config.MinRockerSpacing then
+            Notify(src, locale('rocker_too_close_other'), nil, 'error', 'circle-xmark')
+            return
+        end
     end
+    if count >= Config.MaxGoldRockers then
+        Notify(src, locale('rocker_max_equipment'), nil, 'error', 'circle-xmark')
+        return
+    end
+
+    if not RemoveItem(src, 'tool_goldrocker', 1, 'rsg-goldclaim:place') then return end
+
+    local charinfo = Player.PlayerData.charinfo
+    local owner = ('%s %s'):format(charinfo.firstname, charinfo.lastname)
+    local licensed, claimname = 0, nil
+
+    if GetItemCount(Player, Config.LicenseItem) > 0 and RemoveItem(src, Config.LicenseItem, 1, 'rsg-goldclaim:license') then
+        licensed = 1
+        claimname = locale('rocker_claim_default_name', owner)
+    end
+
+    local propId
+    repeat propId = math.random(111111, 999999) until not GetRockerPropById(propId)
 
     local PropData = {
         id        = propId,
-        proptype  = proptype,
+        proptype  = 'tool_goldrocker',
         x         = location.x,
         y         = location.y,
         z         = location.z,
         h         = heading,
-        hash      = hash,
+        hash      = Config.GoldRocker,
         builder   = citizenid,
         buildtime = os.time(),
         licensed  = licensed,
         claimname = claimname,
     }
 
-    table.insert(Config.PlayerProps, PropData)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[proptype], "remove")
-    RockerSaveProp(PropData, propId, citizenid, owner, proptype, licensed, claimname)
+    Config.PlayerProps[#Config.PlayerProps + 1] = PropData
+    MySQL.insert('INSERT INTO player_goldrockers (properties, propid, citizenid, owner, proptype, licensed, claimname) VALUES (?, ?, ?, ?, ?, ?, ?)', {
+        json.encode(PropData), propId, citizenid, owner, 'tool_goldrocker', licensed, claimname,
+    })
     RockerUpdateProps()
 
-    -- if unlicensed, let the placer know their claim is illegal and unprotected
+    local coordsText = ('%.2f, %.2f, %.2f'):format(location.x, location.y, location.z)
+    Webhook.Log('rocker_placed', src, locale('wh_title_placed'), {
+        { locale('wh_rocker_id'), propId }, { locale('wh_licensed'), licensed == 1 and locale('wh_yes') or locale('wh_no') },
+        { locale('wh_claim_name'), claimname or locale('wh_na') }, { locale('wh_rocker_coords'), coordsText },
+        { locale('wh_rockers_owned'), ('%s/%s'):format(count + 1, Config.MaxGoldRockers) },
+    })
     if licensed == 0 then
-        Notify(src, locale('rocker_unlicensed_notice_title'), locale('rocker_unlicensed_notice_desc'), 'warning', 10000, 'ERROR')
+        Webhook.Log('illegal_placed', src, locale('wh_title_illegal_placed'), {
+            { locale('wh_rocker_id'), propId }, { locale('wh_rocker_coords'), coordsText },
+        })
+        Notify(src, locale('rocker_unlicensed_notice_title'), locale('rocker_unlicensed_notice_desc'), 'warning', 'triangle-exclamation', 10000)
     end
 end)
 
 ---------------------------------------------
--- periodic prop update
+-- pack up (owner only, returns the rocker)
 ---------------------------------------------
-CreateThread(function()
-    while true do
-        Wait(300000)
-        if PropsLoaded then
-            RockerUpdateProps()
-        end
-    end
-end)
-
----------------------------------------------
--- load props on start
----------------------------------------------
-CreateThread(function()
-    RockerLoadProps()
-    Wait(2000)
-    PropsLoaded = true
-    RockerUpdateProps()
-end)
-
----------------------------------------------
--- send props to new player on spawn
----------------------------------------------
-RegisterNetEvent('RSGCore:Server:PlayerLoaded', function(Player)
+RegisterNetEvent('rsg-goldclaim:rocker:server:destroyProp', function(propid)
     local src = source
-    if PropsLoaded then
-        TriggerClientEvent('rsg-goldclaim:rocker:client:updatePropData', src, Config.PlayerProps)
-    end
-end)
-
----------------------------------------------
--- destroy prop (pack up - returns the rocker's own item type to its owner)
----------------------------------------------
-RegisterServerEvent('rsg-goldclaim:rocker:server:destroyProp')
-AddEventHandler('rsg-goldclaim:rocker:server:destroyProp', function(propid)
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
+    local Player, propData
+    Player, propData, propid = ValidateRockerAction(src, propid)
     if not Player then return end
+    if propData.builder ~= Player.PlayerData.citizenid then return end
 
-    local citizenid = Player.PlayerData.citizenid
-    local result = MySQL.query.await('SELECT citizenid, proptype, quality FROM player_goldrockers WHERE propid = ?', {propid})
-    if not result or not result[1] then return end
-    if result[1].citizenid ~= citizenid then return end
-    if result[1].quality ~= 100 then return end
+    if OnCooldown(src, 'packup', 2000) then return end
 
-    local proptype = result[1].proptype
-
-    for k, v in pairs(Config.PlayerProps) do
-        if v.id == propid then
-            table.remove(Config.PlayerProps, k)
-            break
-        end
+    local row = MySQL.single.await('SELECT quality FROM player_goldrockers WHERE propid = ?', { propid })
+    -- re-check after the await: a second request could have removed it meanwhile (item dupe)
+    if not GetRockerPropById(propid) then return end
+    if not row or row.quality < 100 then
+        Notify(src, locale('rocker_needs_repair'), nil, 'error', 'circle-xmark')
+        return
+    end
+    if not Inventory:CanAddItem(src, 'tool_goldrocker', 1) then
+        Notify(src, locale('rocker_inventory_full'), nil, 'error', 'circle-xmark')
+        return
     end
 
-    TriggerClientEvent('rsg-goldclaim:rocker:client:removePropObject', -1, propid)
-    RockerUpdateProps()
-
-    -- remove from DB
-    MySQL.Async.execute('DELETE FROM player_goldrockers WHERE propid = ?', {propid})
-
-    -- return the rocker's own item type to the owner
-    Player.Functions.AddItem(proptype, 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[proptype], "add")
+    RemoveRocker(propid)
+    AddItem(src, 'tool_goldrocker', 1, 'rsg-goldclaim:packup')
+    Webhook.Log('rocker_packed', src, locale('wh_title_packed'), {
+        { locale('wh_rocker_id'), propid }, { locale('wh_claim_name'), propData.claimname or locale('wh_na') },
+    })
+    Notify(src, locale('rocker_packed_up'), nil, 'success', 'circle-check')
 end)
 
 ---------------------------------------------
@@ -362,360 +362,244 @@ end)
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:leodestroy', function(propid)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
+    local Player, propData
+    Player, propData, propid = ValidateRockerAction(src, propid)
     if not Player then return end
 
-    -- verify LEO
-    if not Player.PlayerData.job or Player.PlayerData.job.type ~= 'leo' then
+    local job = Player.PlayerData.job
+    if not job or job.type ~= Config.LeoJobType then
+        Webhook.Suspicious(src, locale('wh_reason_non_leo'), { { locale('wh_rocker_id'), propid }, { locale('wh_job'), job and job.name or locale('wh_none') } })
+        return
+    end
+    if propData.licensed == 1 then return end
+
+    RemoveRocker(propid)
+    AddItem(src, 'tool_goldrocker', 1, 'rsg-goldclaim:confiscate')
+    Webhook.Log('leo_destroyed', src, locale('wh_title_leo_destroyed'), {
+        { locale('wh_rocker_id'), propid }, { locale('wh_owner_citizenid'), propData.builder },
+        { locale('wh_officer_job'), ('%s (%s)'):format(job.label or job.name, job.grade and job.grade.name or '?') },
+    })
+    Notify(src, locale('rocker_claim_destroyed'), locale('rocker_evidence_collected'), 'success', 'circle-check')
+end)
+
+---------------------------------------------
+-- add paydirt / water
+---------------------------------------------
+local function AddResource(src, propid, column, max, item, fullMsg, okMsg, returnItem, actionTime)
+    local Player, _
+    Player, _, propid = ValidateRockerAction(src, propid)
+    if not Player then return end
+    if OnCooldown(src, 'load', actionTime - 1000) then return end -- matches the client action time
+    if GetItemCount(Player, item) < 1 then return end
+
+    local row = MySQL.single.await(('SELECT %s AS amount FROM player_goldrockers WHERE propid = ?'):format(column), { propid })
+    if not row then return end
+    if row.amount >= max then
+        Notify(src, locale(fullMsg), nil, 'error', 'circle-xmark')
         return
     end
 
-    local result = MySQL.query.await('SELECT licensed FROM player_goldrockers WHERE propid = ?', {propid})
-    if not result or not result[1] then return end
-    if result[1].licensed == 1 then return end -- LEO may only confiscate unlicensed (illegal) claims
-
-    for k, v in pairs(Config.PlayerProps) do
-        if v.id == propid then
-            table.remove(Config.PlayerProps, k)
-            break
-        end
+    if not RemoveItem(src, item, 1, 'rsg-goldclaim:load') then return end
+    -- conditional atomic increment: if another player filled it meanwhile, refund instead of losing the item
+    local affected = MySQL.update.await(('UPDATE player_goldrockers SET %s = %s + 1 WHERE propid = ? AND %s < ?'):format(column, column, column), { propid, max })
+    if not affected or affected < 1 then
+        AddItem(src, item, 1, 'rsg-goldclaim:refund')
+        Notify(src, locale(fullMsg), nil, 'error', 'circle-xmark')
+        return
     end
+    if returnItem then AddItem(src, returnItem, 1, 'rsg-goldclaim:load') end
+    Notify(src, locale(okMsg), locale('rocker_level', math.min(row.amount + 1, max), max), 'success', 'circle-check', 3000)
+end
 
-    TriggerClientEvent('rsg-goldclaim:rocker:client:removePropObject', -1, propid)
-    RockerUpdateProps()
-
-    -- remove from DB
-    MySQL.Async.execute('DELETE FROM player_goldrockers WHERE propid = ?', {propid})
-
-    -- give rocker to LEO as evidence
-    Player.Functions.AddItem('goldrocker', 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['goldrocker'], "add")
-end)
-
----------------------------------------------
--- add paydirt to rocker
----------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:addpaydirt', function(propid)
-    print('[rsg-goldclaim][DEBUG] addpaydirt fired, propid=' .. tostring(propid))
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then print('[rsg-goldclaim][DEBUG] addpaydirt: no Player') return end
-
-    local hasPaydirt = Player.Functions.GetItemByName('paydirt')
-    if not hasPaydirt or hasPaydirt.amount < 1 then print('[rsg-goldclaim][DEBUG] addpaydirt: no paydirt item, hasPaydirt=' .. tostring(hasPaydirt)) return end
-
-    -- get current paydirt level
-    local result = MySQL.query.await('SELECT paydirt FROM player_goldrockers WHERE propid = ?', {propid})
-    if not result or not result[1] then print('[rsg-goldclaim][DEBUG] addpaydirt: no DB row for propid=' .. tostring(propid)) return end
-
-    local currentPaydirt = result[1].paydirt
-    if currentPaydirt >= Config.MaxPaydirt then print('[rsg-goldclaim][DEBUG] addpaydirt: already at max, current=' .. tostring(currentPaydirt)) return end
-
-    local newPaydirt = math.min(currentPaydirt + 1, Config.MaxPaydirt)
-
-    Player.Functions.RemoveItem('paydirt', 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['paydirt'], 'remove')
-    MySQL.update('UPDATE player_goldrockers SET paydirt = ? WHERE propid = ?', {newPaydirt, propid})
-    print('[rsg-goldclaim][DEBUG] addpaydirt: success, new value=' .. tostring(newPaydirt))
+    AddResource(source, propid, 'paydirt', Config.MaxPaydirt, 'resource_paydirt', 'rocker_paydirt_full', 'rocker_paydirt_added', nil, Config.AddPaydirtTime)
 end)
 
----------------------------------------------
--- add water to rocker (from fullbucket)
----------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:addwater', function(propid)
-    print('[rsg-goldclaim][DEBUG] addwater fired, propid=' .. tostring(propid))
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then print('[rsg-goldclaim][DEBUG] addwater: no Player') return end
-
-    local hasFullbucket = Player.Functions.GetItemByName('fullbucket')
-    if not hasFullbucket or hasFullbucket.amount < 1 then print('[rsg-goldclaim][DEBUG] addwater: no fullbucket item, hasFullbucket=' .. tostring(hasFullbucket)) return end
-
-    local result = MySQL.query.await('SELECT water FROM player_goldrockers WHERE propid = ?', {propid})
-    if not result or not result[1] then print('[rsg-goldclaim][DEBUG] addwater: no DB row for propid=' .. tostring(propid)) return end
-
-    local currentWater = result[1].water
-    if currentWater >= Config.MaxWater then print('[rsg-goldclaim][DEBUG] addwater: already at max, current=' .. tostring(currentWater)) return end
-
-    local newWater = math.min(currentWater + 1, Config.MaxWater)
-
-    -- remove fullbucket, give back empty bucket
-    Player.Functions.RemoveItem('fullbucket', 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['fullbucket'], 'remove')
-    Player.Functions.AddItem('bucket', 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['bucket'], 'add')
-    MySQL.update('UPDATE player_goldrockers SET water = ? WHERE propid = ?', {newWater, propid})
-    print('[rsg-goldclaim][DEBUG] addwater: success, new value=' .. tostring(newWater))
+    AddResource(source, propid, 'water', Config.MaxWater, 'tool_rocker_bucket_full', 'rocker_water_full', 'rocker_water_added', 'tool_rocker_bucket_empty', Config.AddWaterTime)
 end)
 
 ---------------------------------------------
--- process rocker (async - loops until water or paydirt runs out)
+-- process rocker (server-driven, one cycle per Config.ProcessingTime)
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:processrocker', function(propid)
     local src = source
+    local Player, propData
+    Player, propData, propid = ValidateRockerAction(src, propid)
+    if not Player then return end
 
-    -- prevent double-processing on the same rocker
+    local cid = Player.PlayerData.citizenid
+    if Config.OwnerOnlyProcessing and propData.builder ~= cid then
+        Notify(src, locale('rocker_not_owner'), nil, 'error', 'circle-xmark')
+        return
+    end
     if ProcessingRockers[propid] then
-        Notify(src, locale('rocker_already_processing_title'), locale('rocker_already_processing_desc'), 'cross', 5000, 'ERROR')
+        Notify(src, locale('rocker_already_processing_title'), locale('rocker_already_processing_desc'), 'error', 'circle-xmark')
         return
     end
 
-    local result = MySQL.query.await('SELECT * FROM player_goldrockers WHERE propid = ?', {propid})
-    if not result or not result[1] then return end
-
-    local water = result[1].water
-    local paydirt = result[1].paydirt
-
-    if water <= 0 or paydirt <= 0 then return end
-
-    ProcessingRockers[propid] = true
-
-    -- recursive function: each call = one processing cycle
-    local function RunCycle(remainingWater, remainingPaydirt)
-        local newWater = remainingWater - 1
-        local newPaydirt = remainingPaydirt - 1
-        MySQL.update('UPDATE player_goldrockers SET water = ?, paydirt = ? WHERE propid = ?', {newWater, newPaydirt, propid})
-
-        SetTimeout(Config.ProcessingTime, function()
-            -- determine result
-            local roll = math.random(1, 100)
-            local resultType = 'paydirt'
-            if roll <= Config.GoldChance then
-                resultType = 'gold'
-            end
-
-            -- flag this propid as having an unclaimed output before telling the client to spawn it
-            PendingRockerOutputs[propid] = resultType
-            TriggerClientEvent('rsg-goldclaim:rocker:client:spawnoutputprop', src, propid, resultType)
-
-            -- check if we can continue
-            if newWater > 0 and newPaydirt > 0 then
-                RunCycle(newWater, newPaydirt)
-            else
-                ProcessingRockers[propid] = nil
-                TriggerClientEvent('rsg-goldclaim:rocker:client:processingcomplete', src, propid)
-            end
-        end)
+    -- lock before the await so two rapid requests can't start two parallel processing loops
+    ProcessingRockers[propid] = cid
+    local row = MySQL.single.await('SELECT water, paydirt, quality FROM player_goldrockers WHERE propid = ?', { propid })
+    local fail
+    if not row or not GetRockerPropById(propid) then fail = true
+    elseif row.quality <= 0 then fail = 'rocker_needs_repair'
+    elseif row.water <= 0 then fail = 'rocker_processing_no_water'
+    elseif row.paydirt <= 0 then fail = 'rocker_processing_no_paydirt' end
+    if fail then
+        ProcessingRockers[propid] = nil
+        if fail ~= true then Notify(src, locale(fail), nil, 'error', 'circle-xmark') end
+        return
     end
+    Notify(src, locale('rocker_processing_started'), locale('rocker_processing_will_run', math.min(row.water, row.paydirt)), 'inform', 'coins')
+    Webhook.Log('processing_started', src, locale('wh_title_processing'), {
+        { locale('wh_rocker_id'), propid }, { locale('wh_cycles'), math.min(row.water, row.paydirt) },
+        { locale('wh_water_paydirt'), ('%s / %s'):format(row.water, row.paydirt) }, { locale('wh_condition'), row.quality .. '%' },
+    })
 
-    RunCycle(water, paydirt)
+    CreateThread(function()
+        while true do
+            Wait(Config.ProcessingTime)
+
+            -- stop if the rocker was removed or the player left / switched character
+            -- (checked before consuming, so nothing is lost when a cycle is interrupted)
+            local p = RSGCore.Functions.GetPlayer(src)
+            if not GetRockerPropById(propid) or not p or p.PlayerData.citizenid ~= cid then break end
+
+            -- consume one unit of each atomically; abort if either ran out or the rocker broke
+            local affected = MySQL.update.await('UPDATE player_goldrockers SET water = water - 1, paydirt = paydirt - 1 WHERE propid = ? AND water > 0 AND paydirt > 0 AND quality > 0', { propid })
+            if not affected or affected < 1 then break end
+
+            local resultType = math.random(1, 100) <= Config.GoldChance and 'gold' or 'paydirt'
+            local pending = PendingOutputs[propid]
+            if not pending or pending.cid ~= cid then
+                pending = { cid = cid, gold = 0, paydirt = 0 }
+                PendingOutputs[propid] = pending
+            end
+            pending[resultType] = pending[resultType] + 1
+            TriggerClientEvent('rsg-goldclaim:rocker:client:spawnoutputprop', src, propid, resultType)
+        end
+
+        ProcessingRockers[propid] = nil
+        if GetPlayerPed(src) ~= 0 then
+            TriggerClientEvent('rsg-goldclaim:rocker:client:processingcomplete', src, propid)
+        end
+    end)
 end)
 
 ---------------------------------------------
--- pick up gold (gives random nugget type + random amount)
--- only honored if the server itself flagged this propid as having pending gold output
+-- pick up outputs (only honoured if the server produced them for this player)
 ---------------------------------------------
+local function ConsumePending(src, propid, resultType)
+    local Player, _
+    Player, _, propid = ValidateRockerAction(src, propid, Config.PickupDistance)
+    if not Player then return end
+    local pending = PendingOutputs[propid]
+    if not pending or pending.cid ~= Player.PlayerData.citizenid or pending[resultType] < 1 then return end
+    pending[resultType] = pending[resultType] - 1
+    return Player, propid, pending
+end
+
 RegisterNetEvent('rsg-goldclaim:rocker:server:pickupgold', function(propid)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
+    local Player, pending
+    Player, propid, pending = ConsumePending(src, propid, 'gold')
     if not Player then return end
 
-    if PendingRockerOutputs[propid] ~= 'gold' then return end
-    if not IsPlayerNearProp(src, GetRockerPropById(propid), 10.0) then return end
-    PendingRockerOutputs[propid] = nil
+    local ore = Config.GoldOreItem
+    local amount = math.random(Config.GoldOreAmount.min, Config.GoldOreAmount.max)
 
-    -- weighted random nugget type
-    local roll = math.random(1, 100)
-    local nugget = 'smallnugget'
-    local amountRange = Config.NuggetAmounts.small
-
-    if roll <= Config.NuggetWeights.large then
-        nugget = 'largenugget'
-        amountRange = Config.NuggetAmounts.large
-    elseif roll <= Config.NuggetWeights.large + Config.NuggetWeights.medium then
-        nugget = 'mediumnugget'
-        amountRange = Config.NuggetAmounts.medium
+    if AddItem(src, ore, amount, 'rsg-goldclaim:pickupgold') then
+        TriggerClientEvent('rsg-goldclaim:rocker:client:goldpickupresult', src, amount)
+        Webhook.Log('gold_pickup', src, locale('wh_title_gold'), {
+            { locale('wh_rocker_id'), propid }, { locale('wh_item'), RSGCore.Shared.Items[ore].label }, { locale('wh_amount'), amount },
+        })
+    else
+        pending.gold = pending.gold + 1 -- inventory full: keep it claimable and respawn the prop
+        TriggerClientEvent('rsg-goldclaim:rocker:client:spawnoutputprop', src, propid, 'gold', true)
     end
-
-    -- random amount between min and max
-    local amount = math.random(amountRange.min, amountRange.max)
-
-    Player.Functions.AddItem(nugget, amount)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[nugget], "add")
-
-    -- tell client what they got so it can show a detailed notification
-    TriggerClientEvent('rsg-goldclaim:rocker:client:goldpickupresult', src, nugget, amount)
 end)
 
----------------------------------------------
--- pick up paydirt (gives 1 paydirt back)
--- only honored if the server itself flagged this propid as having pending paydirt output
----------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:pickuppaydirt', function(propid)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
+    local Player, pending
+    Player, propid, pending = ConsumePending(src, propid, 'paydirt')
     if not Player then return end
-
-    if PendingRockerOutputs[propid] ~= 'paydirt' then return end
-    if not IsPlayerNearProp(src, GetRockerPropById(propid), 10.0) then return end
-    PendingRockerOutputs[propid] = nil
-
-    Player.Functions.AddItem('paydirt', 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['paydirt'], "add")
+    if not AddItem(src, 'resource_paydirt', 1, 'rsg-goldclaim:pickuppaydirt') then
+        pending.paydirt = pending.paydirt + 1
+        TriggerClientEvent('rsg-goldclaim:rocker:client:spawnoutputprop', src, propid, 'paydirt', true)
+        return
+    end
+    Webhook.Log('paydirt_pickup', src, locale('wh_title_paydirt'), { { locale('wh_rocker_id'), propid } })
 end)
 
 ---------------------------------------------
--- repair rocker (5x wood)
+-- repair rocker
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:repairrocker', function(propid)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
+    local Player, _
+    Player, _, propid = ValidateRockerAction(src, propid)
     if not Player then return end
+    if OnCooldown(src, 'repair', Config.RepairTime - 1000) then return end
 
-    local hasWood = Player.Functions.GetItemByName('wood')
-    if not hasWood or hasWood.amount < Config.RepairWoodAmount then return end
+    local row = MySQL.single.await('SELECT quality FROM player_goldrockers WHERE propid = ?', { propid })
+    if not row or row.quality >= 100 then return end
+    if GetItemCount(Player, 'resource_wood') < Config.RepairWoodAmount then
+        Notify(src, locale('rocker_not_enough_wood', Config.RepairWoodAmount), nil, 'error', 'circle-xmark')
+        return
+    end
 
-    Player.Functions.RemoveItem('wood', Config.RepairWoodAmount)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['wood'], 'remove')
-    MySQL.update('UPDATE player_goldrockers SET quality = ? WHERE propid = ?', {100, propid})
+    if RemoveItem(src, 'resource_wood', Config.RepairWoodAmount, 'rsg-goldclaim:repair') then
+        MySQL.update('UPDATE player_goldrockers SET quality = 100 WHERE propid = ?', { propid })
+        Notify(src, locale('rocker_repaired'), nil, 'success', 'circle-check')
+    end
 end)
 
 ---------------------------------------------
--- rename claim
+-- rename claim (licensed owner only)
 ---------------------------------------------
 RegisterNetEvent('rsg-goldclaim:rocker:server:renameclaim', function(propid, newname)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
+    local Player, propData
+    Player, propData, propid = ValidateRockerAction(src, propid, Config.ClaimZoneRadius)
     if not Player then return end
+    if propData.builder ~= Player.PlayerData.citizenid or propData.licensed ~= 1 then return end
+    if OnCooldown(src, 'rename', 5000) then return end
 
-    if type(newname) ~= 'string' or #newname < 1 or #newname > 100 then return end
-
-    local citizenid = Player.PlayerData.citizenid
-
-    -- verify ownership
-    local result = MySQL.query.await('SELECT citizenid, licensed FROM player_goldrockers WHERE propid = ?', {propid})
-    if not result or not result[1] then return end
-    if result[1].citizenid ~= citizenid then return end
-    if result[1].licensed ~= 1 then return end
-
-    MySQL.update('UPDATE player_goldrockers SET claimname = ? WHERE propid = ?', {newname, propid})
-
-    -- update in-memory prop data
-    for _, v in pairs(Config.PlayerProps) do
-        if v.id == propid then
-            v.claimname = newname
-            break
-        end
+    if type(newname) ~= 'string' then return end
+    newname = newname:gsub('[%c<>]', ''):gsub('%s+', ' '):match('^%s*(.-)%s*$')
+    if #newname < 3 or #newname > Config.MaxClaimNameLength then
+        Notify(src, locale('rocker_rename_invalid', Config.MaxClaimNameLength), nil, 'error', 'circle-xmark')
+        return
     end
 
-    -- tell all clients to refresh zone/blip
+    MySQL.update('UPDATE player_goldrockers SET claimname = ? WHERE propid = ?', { newname, propid })
+    Webhook.Log('claim_renamed', src, locale('wh_title_renamed'), {
+        { locale('wh_rocker_id'), propid }, { locale('wh_old_name'), propData.claimname or locale('wh_na') }, { locale('wh_new_name'), newname },
+    })
+    propData.claimname = newname
     TriggerClientEvent('rsg-goldclaim:rocker:client:refreshclaim', -1, propid, newname)
+    Notify(src, locale('rocker_claim_renamed'), newname, 'success', 'circle-check')
 end)
 
 ---------------------------------------------
--- smelt nuggets into gold bars (server derives the required nugget cost/ratio itself)
----------------------------------------------
-local NuggetSmeltCosts = {
-    smallnugget  = Config.SmallNuggetSmelt,
-    mediumnugget = Config.MediumNuggetSmelt,
-    largenugget  = Config.LargeNuggetSmelt,
-}
-
-RegisterNetEvent('rsg-goldclaim:rocker:server:finishsmelt', function(nuggettype, bars)
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
-
-    local costPerBar = NuggetSmeltCosts[nuggettype]
-    bars = tonumber(bars)
-
-    if not costPerBar or not bars or bars <= 0 or bars ~= math.floor(bars) then return end
-
-    local amountnuggets = costPerBar * bars
-
-    local hasItem = Player.Functions.GetItemByName(nuggettype)
-    if not hasItem or hasItem.amount < amountnuggets then return end
-
-    Player.Functions.RemoveItem(nuggettype, amountnuggets)
-
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[nuggettype], 'remove')
-    Player.Functions.AddItem('resource_gold_bar', bars)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['resource_gold_bar'], 'add')
-end)
-
----------------------------------------------
--- sell gold bars (server computes the true amount from inventory, never trusts the client)
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:server:sellgoldbars', function()
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
-
-    local goldBarCount = 0
-    for _, item in pairs(Player.PlayerData.items) do
-        if item and item.name == 'resource_gold_bar' then
-            goldBarCount = goldBarCount + item.amount
-        end
-    end
-
-    if goldBarCount <= 0 then return end
-
-    Player.Functions.RemoveItem('resource_gold_bar', goldBarCount)
-
-    local totalvalue = goldBarCount * Config.GoldBarPrice
-    Player.Functions.AddMoney('cash', totalvalue, 'rsg-goldclaim-sell-goldbar')
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['resource_gold_bar'], "remove")
-end)
-
----------------------------------------------
--- sell silver bars (server computes the true amount from inventory, never trusts the client)
----------------------------------------------
-RegisterNetEvent('rsg-goldclaim:rocker:server:sellsilverbars', function()
-    local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
-
-    local silverBarCount = 0
-    for _, item in pairs(Player.PlayerData.items) do
-        if item and item.name == 'resource_silver_bar' then
-            silverBarCount = silverBarCount + item.amount
-        end
-    end
-
-    if silverBarCount <= 0 then return end
-
-    Player.Functions.RemoveItem('resource_silver_bar', silverBarCount)
-
-    local totalvalue = silverBarCount * Config.SilverBarPrice
-    Player.Functions.AddMoney('cash', totalvalue, 'rsg-goldclaim-sell-silverbar')
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items['resource_silver_bar'], "remove")
-end)
-
----------------------------------------------
--- equipment degradation cron (no gold processing)
+-- equipment degradation cron
 ---------------------------------------------
 lib.cron.new(Config.CronJob, function()
-    local degradechance = math.random(1, 100)
-    local result = MySQL.query.await('SELECT * FROM player_goldrockers')
-
-    if not result then return end
-
-    for i = 1, #result do
-        local quality = result[i].quality
-        local propid = result[i].propid
-        local owner = result[i].owner
-
-        -- degrade equipment
-        if quality > 0 and degradechance > (100 - Config.DegradeChance) then
-            MySQL.update('UPDATE player_goldrockers SET quality = ? WHERE propid = ?', {quality - 1, propid})
-        end
-
-        -- remove equipment if fully degraded
-        if quality == 0 then
-            for k, v in pairs(Config.PlayerProps) do
-                if v.id == propid then
-                    table.remove(Config.PlayerProps, k)
-                    break
-                end
-            end
-            TriggerClientEvent('rsg-goldclaim:rocker:client:removePropObject', -1, propid)
-            RockerUpdateProps()
-            TriggerEvent('rsg-log:server:CreateLog', 'rsggoldclaim', 'Gold Equipment Lost', 'red', 'Gold Rocker with ID:' .. propid .. ' belonging to ' .. owner .. ' was lost due to non maintenance!')
-            MySQL.Async.execute('DELETE FROM player_goldrockers WHERE propid = ?', {propid})
-        end
+    -- remove broken rockers first (they had a full cycle at 0% to be repaired)
+    local broken = MySQL.query.await('SELECT propid, owner, citizenid FROM player_goldrockers WHERE quality <= 0') or {}
+    for i = 1, #broken do
+        local row = broken[i]
+        RemoveRocker(row.propid)
+        Webhook.Log('rocker_lost', nil, locale('wh_title_lost'), {
+            { locale('wh_rocker_id'), row.propid }, { locale('wh_owner'), row.owner }, { locale('wh_citizenid'), row.citizenid },
+        }, { description = locale('wh_lost_desc') })
     end
 
-    if Config.Debug then
-        print(locale('rocker_server_cron_ran'))
-    end
+    -- independent roll per rocker, done in a single query
+    MySQL.update('UPDATE player_goldrockers SET quality = quality - 1 WHERE quality > 0 AND RAND() * 100 < ?', { Config.DegradeChance })
+
+    if #broken > 0 then RockerUpdateProps() end
+    Debug('degradation cron ran')
 end)

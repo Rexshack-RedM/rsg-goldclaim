@@ -1,8 +1,11 @@
 Config = {}
-Config.PlayerProps = {}
+Config.PlayerProps = {} -- populated at runtime by the server, do not edit
 
--- Debug Settings
 Config.Debug = false
+
+-- ox_lib notification position: 'top' | 'top-right' | 'top-left' | 'bottom' | 'bottom-right' | 'bottom-left' | 'center-right' | 'center-left'
+Config.NotifyPosition = 'top-right'
+Config.NotifyDuration = 10000 -- default notification duration (ms)
 
 ---------------------------------------------
 -- general settings (gold rocker / claims)
@@ -10,41 +13,42 @@ Config.Debug = false
 Config.EnableVegModifier    = true                   -- clears vegetation around placed rockers
 Config.GoldRocker           = `p_goldcradlestand01x` -- prop used for gold rocker
 Config.MaxGoldRockers       = 4                      -- maximum gold rockers per character
-Config.DegradeChance        = 5                      -- % chance of equipment degrading per cron cycle
-Config.CronJob              = '*/30 * * * *'         -- cron schedule for degradation only
-Config.CycleNotify          = true                   -- print when cron cycle runs
+Config.DegradeChance        = 5                      -- % chance (per rocker) of losing 1% quality each cron cycle
+Config.CronJob              = '*/30 * * * *'         -- cron schedule for degradation
 Config.RepairWoodAmount     = 5                      -- amount of wood needed to repair
-Config.EnableTarget         = true                   -- toggle target for gold agent NPCs
+Config.LeoJobType           = 'leo'                  -- job type allowed to destroy unlicensed claims
+Config.OwnerOnlyProcessing  = true                   -- only the owner can start processing (and receives the output)
+Config.LicenseItem          = 'resource_gold_claim_license' -- consumed on placement to make the claim licensed
+
+---------------------------------------------
+-- distances (server-side anti-exploit checks)
+---------------------------------------------
+Config.InteractDistance     = 5.0                    -- max distance from a rocker to interact with it
+Config.PickupDistance       = 10.0                   -- max distance from a rocker to pick up its output
+Config.PlaceMaxDistance     = 6.0                    -- max distance between player and placed rocker
+Config.MinRockerSpacing     = 4.0                    -- min distance between two rockers
+Config.PropDrawDistance     = 60.0                   -- distance at which rocker props are streamed in
 
 ---------------------------------------------
 -- processing settings
 ---------------------------------------------
-Config.ProcessingTime       = 60000                  -- time in ms to process (1 minute)
+Config.ProcessingTime       = 60000                  -- time in ms per processing cycle
 Config.GoldChance           = 50                     -- % chance of gold vs paydirt return
 Config.AddPaydirtTime       = 10000                  -- time in ms to add paydirt to rocker
 Config.AddWaterTime         = 10000                  -- time in ms to add water to rocker
 Config.MaxPaydirt           = 5                      -- max paydirt units a rocker can hold
 Config.MaxWater             = 5                      -- max water units a rocker can hold
 Config.RepairTime           = 10000                  -- time in ms to repair
-Config.CollectGoldTime      = 10000                  -- time in ms to pack up
+Config.PackUpTime           = 10000                  -- time in ms to pack up
+Config.PlaceTime            = 10000                  -- time in ms to set up a rocker
+Config.DestroyTime          = 10000                  -- time in ms for LEO to destroy an illegal claim
+Config.PickupTime           = 3000                   -- time in ms to pick up an output prop
 
 ---------------------------------------------
--- nugget weight distribution
+-- gold ore output (random amount per gold pickup)
 ---------------------------------------------
-Config.NuggetWeights = {
-    small  = 50,  -- 50% chance
-    medium = 35,  -- 35% chance
-    large  = 15,  -- 15% chance
-}
-
----------------------------------------------
--- nugget amount ranges (random between min/max)
----------------------------------------------
-Config.NuggetAmounts = {
-    small  = { min = 1, max = 10 },
-    medium = { min = 1, max = 5 },
-    large  = { min = 1, max = 3 },
-}
+Config.GoldOreItem   = 'resource_gold_nugget'
+Config.GoldOreAmount = { min = 1, max = 5 }
 
 ---------------------------------------------
 -- gathering settings (shovel / bucket)
@@ -63,9 +67,17 @@ Config.PropSpawnOffset      = 1.5                             -- distance to sid
 -- shovel prop (attached to hand during dig)
 ---------------------------------------------
 Config.ShovelProp = {
-    model = 'p_shovel02x',
-    bone  = 'skel_r_hand',
-    offset = {0.06, -0.06, -0.03, 270.0, 165.0, 150.0},
+    model  = `p_shovel02x`,
+    bone   = 'SKEL_R_Hand',
+    offset = { 0.0, -0.19, -0.089, 274.1899, 483.89, 378.40 },
+}
+
+-- dirt pile spawned in front of the player after a successful dig (cosmetic, local only)
+Config.DigDirtPile = {
+    enabled  = true,
+    model    = `mp005_p_dirtpile_tall_unburied`,
+    offset   = 0.6,    -- distance in front of the player
+    lifetime = 30000,  -- ms before it is removed
 }
 
 ---------------------------------------------
@@ -76,27 +88,16 @@ Config.Anims = {
         dict = 'amb_work@world_human_gravedig@working@male_b@base',
         name = 'base',
     },
-    crouch_inspect = 'WORLD_HUMAN_CROUCH_INSPECT', -- scenario
-    add_paydirt = 'WORLD_HUMAN_FEED_PIGS',         -- scenario used when adding paydirt to a rocker
-    add_water = 'WORLD_HUMAN_BUCKET_POUR_LOW',     -- scenario used when adding water to a rocker
-    bucket_fill = {
-        dict = 'amb_work@world_human_bucket_fill@working@male_b@base',
-        name = 'base',
-    },
-    processing = {
-        dict = 'amb_work@world_human_gravedig@working@male_b@idle_a',
-        name = 'idle_a',
-    },
+    crouch_inspect = `WORLD_HUMAN_CROUCH_INSPECT`,  -- scenario
+    add_paydirt    = `WORLD_HUMAN_FEED_PIGS`,       -- scenario used when adding paydirt
+    add_water      = `WORLD_HUMAN_BUCKET_POUR_LOW`, -- scenario used when adding water
 }
 
 ---------------------------------------------
--- claim zone settings
+-- claim zone / blip settings
 ---------------------------------------------
-Config.ClaimZoneRadius      = 20.0                   -- radius in meters for licensed claim zone
-
----------------------------------------------
--- claim blip settings
----------------------------------------------
+Config.ClaimZoneRadius = 20.0
+Config.MaxClaimNameLength = 50
 Config.ClaimBlip = {
     blipSprite = 'blip_gold',
     blipScale  = 0.2,
@@ -104,163 +105,6 @@ Config.ClaimBlip = {
 }
 
 ---------------------------------------------
--- equipment blip settings (legacy for rocker)
+-- placement
 ---------------------------------------------
-Config.Blip = {
-    blipName   = 'Gold Claim',
-    blipSprite = 'blip_gold',
-    blipScale  = 0.2,
-    blipColour = 'BLIP_MODIFIER_MP_COLOR_6',
-}
-
----------------------------------------------
--- gold agent / smelting settings
----------------------------------------------
-Config.SmallNuggetSmelt  = 45
-Config.MediumNuggetSmelt = 30
-Config.LargeNuggetSmelt  = 15
-Config.GoldBarPrice      = 500
-Config.SilverBarPrice    = 400
-Config.SmeltTime         = 30000
-
----------------------------------------------
--- gold agent blip settings
----------------------------------------------
-Config.GoldAgentBlip = {
-    blipName   = 'Gold-Silver Agent',
-    blipSprite = 'blip_gold',
-    blipScale  = 0.2,
-}
-
----------------------------------------------
--- deploy prop settings (rocker placement system)
----------------------------------------------
-Config.ForwardDistance    = 2.0
-Config.PromptGroupName   = 'Place Equipment'
-Config.PromptCancelName  = 'Cancel'
-Config.PromptPlaceName   = 'Set'
-Config.PromptRotateLeft  = 'Rotate Left'
-Config.PromptRotateRight = 'Rotate Right'
-
----------------------------------------------
--- npc settings
----------------------------------------------
-Config.DistanceSpawn = 20.0
-Config.FadeIn        = true
-Config.Keybind       = 'J'
-
----------------------------------------------
--- gold agent locations
----------------------------------------------
-Config.GoldAgentLocations = {
-    {
-        name      = 'Valentine Gold Agent',
-        prompt    = 'val-goldagent',
-        coords    = vector3(-303.14, 778.55, 118.70),
-        npcmodel  = `s_m_m_bankclerk_01`,
-        npccoords = vector4(-303.14, 778.55, 118.70, 110.30),
-        showblip  = true,
-    },
-    {
-        name      = 'St Denis Gold Agent',
-        prompt    = 'std-goldagent',
-        coords    = vector3(2651.56, -1293.23, 52.25),
-        npcmodel  = `s_m_m_bankclerk_01`,
-        npccoords = vector4(2651.56, -1293.23, 52.25, 114.41),
-        showblip  = true,
-    },
-    {
-        name      = 'Rhodes Gold Agent',
-        prompt    = 'rho-goldagent',
-        coords    = vector3(1288.81, -1298.36, 77.04),
-        npcmodel  = `s_m_m_bankclerk_01`,
-        npccoords = vector4(1288.81, -1298.36, 77.04, 232.77),
-        showblip  = true,
-    },
-}
-
----------------------------------------------------------------------------
--- Smelter subsystem
--- Namespaced under Config.Smelter to avoid colliding with the rocker
--- settings above (both scripts originally shipped as separate resources
--- and both used generic names like PlayerProps / ForwardDistance / etc.)
----------------------------------------------------------------------------
-Config.Smelter = {}
-Config.Smelter.PlayerProps = {}
-
----------------------------------------------
--- deploy prop settings (smelter placement system)
----------------------------------------------
-Config.Smelter.ForwardDistance  = 1.5
-Config.Smelter.PromptGroupName  = 'Place Smelter'
-Config.Smelter.PromptCancelName = 'Cancel'
-Config.Smelter.PromptPlaceName  = 'Place'
-Config.Smelter.PromptRotateLeft  = 'Rotate Left'
-Config.Smelter.PromptRotateRight = 'Rotate Right'
-
----------------------------------------------
--- general settings
----------------------------------------------
-Config.Smelter.EnableVegModifier = true                       -- if set true clears vegetation around smelter
-Config.Smelter.DestroyTime       = 10000                      -- how long for destroy progress bar (ms)
-Config.Smelter.MaxSmelters       = 2                          -- max smelters a character can have
-Config.Smelter.SmelterProp       = 'p_goldsmeltburner01x'     -- prop used for smelter
-
----------------------------------------------
--- gold claim restriction
--- NOTE: If true, the player must be standing within the radius of one of
--- their own licensed gold claims (from the rocker subsystem) to place a smelter
----------------------------------------------
-Config.Smelter.RequireGoldClaim  = false
-Config.Smelter.GoldClaimRadius   = 20.0                       -- must match Config.ClaimZoneRadius above
-
----------------------------------------------
--- smelting settings (informational; actual amounts live in Config.Smelter.Recipes)
----------------------------------------------
-Config.Smelter.SmallNuggetSmelt  = 45                         -- small nuggets required for 1 gold bar
-Config.Smelter.MediumNuggetSmelt = 30                         -- medium nuggets required for 1 gold bar
-Config.Smelter.LargeNuggetSmelt  = 15                         -- large nuggets required for 1 gold bar
-Config.Smelter.SilverOreSmelt    = 15                         -- silver ore required for 1 silver bar
-Config.Smelter.SmeltTime         = 30000                      -- time to smelt one bar (ms)
-
----------------------------------------------
--- recipes (used by the NUI crafting system)
----------------------------------------------
-Config.Smelter.Recipes = {
-    ["goldbar_small"] = {
-        name = "Gold Bar (Small Nuggets)",
-        crafttime = 30000,
-        category = "Gold",
-        ingredients = {
-            [1] = { item = "smallnugget", amount = 45 }
-        },
-        receive = "resource_gold_bar"
-    },
-    ["goldbar_medium"] = {
-        name = "Gold Bar (Medium Nuggets)",
-        crafttime = 30000,
-        category = "Gold",
-        ingredients = {
-            [1] = { item = "mediumnugget", amount = 30 }
-        },
-        receive = "resource_gold_bar"
-    },
-    ["goldbar_large"] = {
-        name = "Gold Bar (Large Nuggets)",
-        crafttime = 30000,
-        category = "Gold",
-        ingredients = {
-            [1] = { item = "largenugget", amount = 15 }
-        },
-        receive = "resource_gold_bar"
-    },
-    ["silverbar"] = {
-        name = "Silver Bar",
-        crafttime = 30000,
-        category = "Silver",
-        ingredients = {
-            [1] = { item = "resource_silver_ore", amount = 50 }
-        },
-        receive = "resource_silver_bar"
-    },
-}
+Config.ForwardDistance = 2.0
